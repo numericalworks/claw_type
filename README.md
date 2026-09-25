@@ -45,6 +45,25 @@ identically.
 - **Non-ASCII text is measured properly** — CJK characters are counted by
   display width, not by byte length.
 
+## Scripts and fonts
+
+egui's bundled fonts cover Latin, Cyrillic, Greek and emoji, but **no Indic,
+Arabic, Hebrew or CJK scripts** — without help those characters fall back to
+`.notdef` and show as empty boxes. To prevent that, `claw_type` looks for a
+**system** font for Tamil (macOS *Tamil MN*; Linux *Noto Sans Tamil* or *Lohit
+Tamil*; Windows *Nirmala UI* or *Latha*) and registers it as a fallback, leaving
+the built-in fonts in charge of everything Latin.
+
+egui 0.36 shapes text with HarfBuzz (via `harfrust`), so this is enough for
+correct rendering — conjuncts, the split `ை`/`ி` vowel signs and mark
+positioning such as the `்` pulli all come out right, not just the base letters.
+
+To cover another script, add its font paths in `src/fonts.rs`; the directory
+scan is name-based, so a `*devanagari*` or `*arabic*` search works the same way.
+
+The terminal front-end cannot choose a font — it relies on your terminal
+emulator's, so install a Tamil-capable font there too if you need it.
+
 ## Key bindings
 
 | Key | Action |

@@ -16,6 +16,8 @@ use egui::{
 use claw_type::markdown::{self, MStyle, Mode, Role};
 use claw_type::palette::{Rgb, Theme};
 
+mod fonts;
+
 /// Base body text size, in points.
 const BODY_SIZE: f32 = 18.0;
 /// The writing column never grows wider than this.
@@ -585,6 +587,11 @@ impl eframe::App for App {
 // -- styling ----------------------------------------------------------------
 
 fn configure(ctx: &egui::Context, theme: &Theme) {
+    // Register a system font for any script the bundled fonts do not cover
+    // (Tamil, and other Indic scripts), so those characters render instead of
+    // showing as empty boxes.
+    fonts::install_tamil_fallback(ctx);
+
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = rgb(theme.bg);
     visuals.window_fill = rgb(theme.overlay_bg);
@@ -923,6 +930,80 @@ mod tests {
             repeat: false,
             modifiers,
         }]
+    }
+
+    /// The advance width of every glyph the given text lays out to.
+    fn glyph_widths(ctx: &egui::Context, text: &str) -> Vec<i32> {
+        // The font system is only built once the context has run a frame.
+        let mut output = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        output.textures_delta.clear();
+
+        let mut job = LayoutJob::default();
+        job.append(
+            text,
+            0.0,
+            TextFormat {
+                font_id: FontId::proportional(BODY_SIZE),
+                color: Color32::WHITE,
+                ..Default::default()
+            },
+        );
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        galley
+            .rows
+            .iter()
+            .flat_map(|row| row.row.glyphs.iter())
+            .map(|glyph| (glyph.advance_width * 64.0).round() as i32)
+            .collect()
+    }
+
+    fn distinct(values: &[i32]) -> usize {
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted.len()
+    }
+
+    /// Tamil must render with real glyphs, not `.notdef` boxes.
+    ///
+    /// Without a Tamil font every character falls back to the same `.notdef`
+    /// glyph and so shares one advance width; with the fallback registered the
+    /// glyphs (and their widths) differ.
+    #[test]
+    fn tamil_renders_with_real_glyphs() {
+        let text = "வாழ்க வையகம்";
+
+        if fonts::find_tamil_font().is_none() {
+            eprintln!("no Tamil font installed; cannot check rendering");
+            return;
+        }
+
+        let without = glyph_widths(&egui::Context::default(), text);
+
+        let ctx = egui::Context::default();
+        fonts::install_tamil_fallback(&ctx);
+        let with = glyph_widths(&ctx, text);
+
+        assert!(!without.is_empty() && !with.is_empty());
+        assert!(
+            distinct(&with) > distinct(&without),
+            "fallback should bring in real glyphs: without={without:?} with={with:?}"
+        );
+        assert!(
+            distinct(&with) >= 3,
+            "Tamil glyphs should not share a single advance: {with:?}"
+        );
+    }
+
+    /// The window lays out Tamil text without panicking.
+    #[test]
+    fn tamil_draws_in_the_editor() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "# தலைப்பு\n\nவாழ்க வையகம்\n".to_owned();
+        frame(&ctx, &mut app, Vec::new());
+        app.view = View::Preview;
+        frame(&ctx, &mut app, Vec::new());
     }
 
     /// Drive the whole interface headlessly: this exercises the panels, the
