@@ -207,13 +207,12 @@ impl App {
         if self.modal != Modal::None {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 self.modal = Modal::None;
+                return;
             }
-            if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1)) {
-                self.modal = if self.modal == Modal::Help {
-                    Modal::None
-                } else {
-                    Modal::Help
-                };
+            // Cmd+H, Ctrl+H and F1 all toggle the help panel back closed. The
+            // unsaved-changes prompt is left alone by them.
+            if self.modal == Modal::Help && help_shortcut_pressed(ctx) {
+                self.modal = Modal::None;
             }
             return;
         }
@@ -248,7 +247,7 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
             self.request_quit(ctx);
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1)) {
+        if help_shortcut_pressed(ctx) {
             self.modal = Modal::Help;
         }
 
@@ -509,7 +508,7 @@ impl App {
                             ("Cmd/Ctrl+B", "Show or hide the status bar"),
                             ("Cmd/Ctrl+Z", "Undo"),
                             ("Shift+Cmd/Ctrl+Z", "Redo"),
-                            ("F1", "This help"),
+                            ("Cmd/Ctrl+H  or  F1", "This help"),
                             ("Esc", "Close a panel"),
                             ("drop a file", "Open it"),
                         ];
@@ -802,6 +801,16 @@ fn paragraph_bounds(text: &str, line: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// True if the user pressed a "show help" shortcut: Cmd+H or Ctrl+H, or F1.
+///
+/// `Modifiers::COMMAND` and `Modifiers::CTRL` are distinct chords on macOS, so
+/// both are accepted; on other platforms they coincide.
+fn help_shortcut_pressed(ctx: &egui::Context) -> bool {
+    ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::H))
+        || ctx.input_mut(|i| i.consume_key(Modifiers::CTRL, Key::H))
+        || ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::F1))
+}
+
 fn open_dialog() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .add_filter("Markdown", &["md", "markdown", "mdown", "txt"])
@@ -892,6 +901,30 @@ mod tests {
         assert_eq!(job.text, " x");
     }
 
+    /// Run one frame headlessly. No renderer is attached, so the texture deltas
+    /// are discarded explicitly rather than left dangling.
+    fn frame(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        output.textures_delta.clear();
+    }
+
+    /// A synthetic key-press event.
+    fn key(key: Key, modifiers: Modifiers) -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }]
+    }
+
     /// Drive the whole interface headlessly: this exercises the panels, the
     /// `TextEdit` with its custom layouter, the fonts and the preview.
     #[test]
@@ -900,24 +933,39 @@ mod tests {
         let mut app = App::new(&ctx, None);
         app.text = "# Hello\n\nsome **bold** and `code` text\n\n- one\n- two\n\n> quote".to_owned();
 
-        let frame = |app: &mut App| {
-            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
-            // No renderer is attached, so the texture deltas are discarded
-            // explicitly rather than left dangling.
-            output.textures_delta.clear();
-        };
-
-        frame(&mut app);
+        frame(&ctx, &mut app, Vec::new());
 
         app.view = View::Preview;
-        frame(&mut app);
+        frame(&ctx, &mut app, Vec::new());
 
         app.focus = true;
         app.typewriter = true;
         app.show_bar = false;
-        frame(&mut app);
+        frame(&ctx, &mut app, Vec::new());
 
         app.modal = Modal::Help;
-        frame(&mut app);
+        frame(&ctx, &mut app, Vec::new());
+    }
+
+    /// The help panel opens with Cmd+H, Ctrl+H or F1, and each of them also
+    /// closes it again.
+    #[test]
+    fn help_shortcuts_all_toggle_help() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+
+        let chords: [(&str, Vec<egui::Event>); 3] = [
+            ("Cmd+H", key(Key::H, Modifiers::COMMAND)),
+            // Also accepted, because macOS may take Cmd+H for its Hide item.
+            ("Ctrl+H", key(Key::H, Modifiers::CTRL)),
+            ("F1", key(Key::F1, Modifiers::NONE)),
+        ];
+
+        for (label, events) in chords {
+            frame(&ctx, &mut app, events.clone());
+            assert!(app.modal == Modal::Help, "{label} should open help");
+            frame(&ctx, &mut app, events);
+            assert!(app.modal == Modal::None, "{label} should close help");
+        }
     }
 }

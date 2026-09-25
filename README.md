@@ -58,7 +58,7 @@ identically.
 | `Cmd/Ctrl+T` | Toggle typewriter scrolling |
 | `Cmd/Ctrl+B` | Show or hide the status bar |
 | `Cmd/Ctrl+Z` / `Shift+Cmd/Ctrl+Z` | Undo / redo |
-| `F1` | Shortcut help |
+| `Cmd/Ctrl+H` or `F1` | Shortcut help |
 | `Esc` | Close a panel |
 
 The terminal front-end has the same bindings (its status bar also toggles with

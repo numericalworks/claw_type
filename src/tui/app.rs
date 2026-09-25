@@ -199,13 +199,10 @@ impl App {
 
     // -- overlays -----------------------------------------------------------
 
-    fn handle_help_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter | KeyCode::F(1) => {
-                self.overlay = Overlay::None;
-            }
-            _ => {}
-        }
+    fn handle_help_key(&mut self, _key: KeyEvent) {
+        // The panel promises "press any key to close", so that is exactly what
+        // happens; it also makes Ctrl+H a toggle.
+        self.overlay = Overlay::None;
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) {
@@ -323,6 +320,10 @@ impl App {
                 }
                 KeyCode::Char('b') => {
                     self.show_bar = !self.show_bar;
+                    return;
+                }
+                KeyCode::Char('h') => {
+                    self.overlay = Overlay::Help;
                     return;
                 }
                 KeyCode::Char('z') | KeyCode::Char('Z') => {
@@ -598,6 +599,25 @@ mod tests {
         a.move_vertical(1);
         assert_eq!(a.buf.line, 1);
         assert_eq!(a.buf.col, 2);
+    }
+
+    #[test]
+    fn ctrl_h_toggles_help() {
+        let mut a = app("hello");
+        a.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL));
+        assert!(matches!(a.overlay, Overlay::Help));
+        // The panel promises "press any key to close".
+        a.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(a.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn f1_opens_help_too() {
+        let mut a = app("hello");
+        a.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(a.overlay, Overlay::Help));
+        a.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert!(matches!(a.overlay, Overlay::None));
     }
 
     #[test]

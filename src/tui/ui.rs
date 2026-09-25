@@ -93,7 +93,7 @@ fn draw_placeholder(frame: &mut Frame, app: &App, rect: Rect) {
         Line::from(Span::styled("Start writing…", theme.dim_style())),
         Line::from(""),
         Line::from(Span::styled(
-            "F1 shortcuts   Ctrl+P preview   Ctrl+S save",
+            "Ctrl+H shortcuts   Ctrl+P preview   Ctrl+S save",
             Style::default().fg(theme.marker_color()),
         )),
     ];
@@ -239,6 +239,7 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
         entry("Shift+Tab", "outdent"),
         Line::from(""),
         heading("View"),
+        entry("Ctrl+H / F1", "this help"),
         entry("Ctrl+P", "toggle rendered preview"),
         entry("Ctrl+F", "focus mode — dim other paragraphs"),
         entry("Ctrl+T", "typewriter scrolling"),
