@@ -1,17 +1,13 @@
-//! A small, self-contained Markdown parser, shared by both front-ends.
+//! A small, self-contained Markdown parser.
 //!
-//! The parser does not know about colours. It emits a stream of
-//! `(char, MStyle)` pairs, where `MStyle` describes the *role* of each
-//! character (heading, code, marker, ...) rather than an appearance. Each
-//! front-end maps those roles onto its own styling — [`crate::palette`]
-//! provides the shared colours.
+//! It tags every character of the source with a *role* — heading, code, marker,
+//! link, … — rather than a colour, so the editor can show the raw document with
+//! syntax colour without the parser knowing anything about appearance. The
+//! [`crate::palette`] maps roles to colours.
 //!
-//! It has two jobs:
-//!
-//! * [`Mode::Highlight`] keeps every character of the source and just tags the
-//!   Markdown punctuation, so an editor can show the raw document with colour.
-//! * [`Mode::Render`] strips the punctuation and applies real styling, for a
-//!   rendered preview.
+//! The character-level block and inline scanners here are also reused by
+//! [`crate::html`], which turns the same source into HTML for the browser
+//! preview — one set of rules, so highlighting and preview cannot disagree.
 
 /// What a character *means* in the document.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
@@ -137,27 +133,15 @@ impl MStyle {
     }
 }
 
-/// How a document should be interpreted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Mode {
-    /// Keep the source text, tag the syntax.
-    Highlight,
-    /// Drop the syntax and style the result.
-    Render,
-}
-
 /// The kind of a list marker.
 #[derive(Debug, PartialEq, Eq)]
-enum ListKind {
+pub(crate) enum ListKind {
     Bullet,
     Ordered(String),
 }
 
-/// Convert a document into tagged character sequences, one per logical line.
-///
-/// `width` is the width of the rendering column; it is used to size horizontal
-/// rules in [`Mode::Render`].
-pub fn transform(lines: &[String], mode: Mode, width: usize) -> Vec<Vec<(char, MStyle)>> {
+/// Tag every character of a document, one `Vec` per logical line.
+pub fn highlight(lines: &[String]) -> Vec<Vec<(char, MStyle)>> {
     let mut out = Vec::with_capacity(lines.len());
     // Some `(marker, length)` while inside a fenced code block.
     let mut fence: Option<(char, usize)> = None;
@@ -171,23 +155,16 @@ pub fn transform(lines: &[String], mode: Mode, width: usize) -> Vec<Vec<(char, M
                 && l >= len
             {
                 fence = None;
-                out.push(fence_line(&chars, mode));
+                out.push(fence_line(&chars));
             } else {
-                out.push(match mode {
-                    Mode::Highlight => styled(&chars, MStyle::code()),
-                    Mode::Render => {
-                        let mut row = styled(&['│', ' '], MStyle::rule());
-                        row.extend(inline(&chars, MStyle::code(), mode));
-                        row
-                    }
-                });
+                out.push(styled(&chars, MStyle::code()));
             }
             continue;
         }
 
         if let Some((m, l)) = fence_of(&chars) {
             fence = Some((m, l));
-            out.push(fence_line(&chars, mode));
+            out.push(fence_line(&chars));
             continue;
         }
 
@@ -196,78 +173,40 @@ pub fn transform(lines: &[String], mode: Mode, width: usize) -> Vec<Vec<(char, M
             if chars.get(level) == Some(&' ') {
                 content += 1;
             }
-            out.push(match mode {
-                Mode::Highlight => {
-                    let mut row = styled(&chars[..content], MStyle::heading_marker(level));
-                    row.extend(inline(&chars[content..], MStyle::heading(level), mode));
-                    row
-                }
-                Mode::Render => inline(&chars[content..], MStyle::heading(level), mode),
-            });
-            continue;
-        }
-
-        if is_rule(&chars) {
-            out.push(match mode {
-                Mode::Highlight => styled(&chars, MStyle::rule()),
-                Mode::Render => vec![('─', MStyle::rule()); width.max(1)],
-            });
-            continue;
-        }
-
-        if let Some(prefix_len) = blockquote_prefix(&chars) {
-            let content = &chars[prefix_len..];
-            out.push(match mode {
-                Mode::Highlight => {
-                    let mut row = styled(&chars[..prefix_len], MStyle::marker());
-                    row.extend(inline(content, MStyle::quote(), mode));
-                    row
-                }
-                Mode::Render => {
-                    let mut row = styled(&['│', ' '], MStyle::quote());
-                    row.extend(inline(content, MStyle::quote(), mode));
-                    row
-                }
-            });
-            continue;
-        }
-
-        if let Some((prefix_len, indent_len, kind)) = list_prefix(&chars) {
-            let content = &chars[prefix_len..];
-            let mut row = styled(&chars[..indent_len], MStyle::text());
-            match mode {
-                Mode::Highlight => {
-                    row.extend(styled(&chars[indent_len..prefix_len], MStyle::list()));
-                }
-                Mode::Render => {
-                    let bullet: Vec<char> = match &kind {
-                        ListKind::Bullet => vec!['•', ' '],
-                        ListKind::Ordered(number) => {
-                            let mut b: Vec<char> = number.chars().collect();
-                            b.push(' ');
-                            b
-                        }
-                    };
-                    row.extend(styled(&bullet, MStyle::list()));
-                }
-            }
-            row.extend(inline(content, MStyle::text(), mode));
+            let mut row = styled(&chars[..content], MStyle::heading_marker(level));
+            row.extend(inline(&chars[content..], MStyle::heading(level)));
             out.push(row);
             continue;
         }
 
-        out.push(inline(&chars, MStyle::text(), mode));
+        if is_rule(&chars) {
+            out.push(styled(&chars, MStyle::rule()));
+            continue;
+        }
+
+        if let Some(prefix_len) = blockquote_prefix(&chars) {
+            let mut row = styled(&chars[..prefix_len], MStyle::marker());
+            row.extend(inline(&chars[prefix_len..], MStyle::quote()));
+            out.push(row);
+            continue;
+        }
+
+        if let Some((prefix_len, indent_len, _kind)) = list_prefix(&chars) {
+            let mut row = styled(&chars[..indent_len], MStyle::text());
+            row.extend(styled(&chars[indent_len..prefix_len], MStyle::list()));
+            row.extend(inline(&chars[prefix_len..], MStyle::text()));
+            out.push(row);
+            continue;
+        }
+
+        out.push(inline(&chars, MStyle::text()));
     }
 
     out
 }
 
-fn fence_line(chars: &[char], mode: Mode) -> Vec<(char, MStyle)> {
-    match mode {
-        Mode::Highlight => styled(chars, MStyle::fence()),
-        // The fence itself carries no meaning once rendered.
-        Mode::Render => Vec::new(),
-    }
+fn fence_line(chars: &[char]) -> Vec<(char, MStyle)> {
+    styled(chars, MStyle::fence())
 }
 
 fn styled(chars: &[char], style: MStyle) -> Vec<(char, MStyle)> {
@@ -279,7 +218,7 @@ fn push_styled(out: &mut Vec<(char, MStyle)>, chars: &[char], style: MStyle) {
 }
 
 /// Detect the opening or closing fence of a code block.
-fn fence_of(chars: &[char]) -> Option<(char, usize)> {
+pub(crate) fn fence_of(chars: &[char]) -> Option<(char, usize)> {
     let mut i = 0;
     while i < chars.len() && chars[i] == ' ' {
         i += 1;
@@ -296,7 +235,7 @@ fn fence_of(chars: &[char]) -> Option<(char, usize)> {
 }
 
 /// ATX heading level (`#`..`######`), if the line is a heading.
-fn heading_level(chars: &[char]) -> Option<usize> {
+pub(crate) fn heading_level(chars: &[char]) -> Option<usize> {
     let mut hashes = 0;
     while hashes < chars.len() && chars[hashes] == '#' {
         hashes += 1;
@@ -311,7 +250,7 @@ fn heading_level(chars: &[char]) -> Option<usize> {
 }
 
 /// A thematic break (`---`, `***`, `___`, ...).
-fn is_rule(chars: &[char]) -> bool {
+pub(crate) fn is_rule(chars: &[char]) -> bool {
     let mut marker: Option<char> = None;
     let mut count = 0;
     for &c in chars {
@@ -335,7 +274,7 @@ fn is_rule(chars: &[char]) -> bool {
 }
 
 /// Length of a leading `>` quote marker, including indentation.
-fn blockquote_prefix(chars: &[char]) -> Option<usize> {
+pub(crate) fn blockquote_prefix(chars: &[char]) -> Option<usize> {
     let mut i = 0;
     while i < chars.len() && chars[i] == ' ' {
         i += 1;
@@ -351,7 +290,7 @@ fn blockquote_prefix(chars: &[char]) -> Option<usize> {
 }
 
 /// `(prefix_len, indent_len, kind)` for a list item.
-fn list_prefix(chars: &[char]) -> Option<(usize, usize, ListKind)> {
+pub(crate) fn list_prefix(chars: &[char]) -> Option<(usize, usize, ListKind)> {
     let mut i = 0;
     while i < chars.len() && chars[i] == ' ' {
         i += 1;
@@ -375,7 +314,7 @@ fn list_prefix(chars: &[char]) -> Option<(usize, usize, ListKind)> {
     None
 }
 
-fn run_len(chars: &[char], from: usize, c: char) -> usize {
+pub(crate) fn run_len(chars: &[char], from: usize, c: char) -> usize {
     let mut n = 0;
     while from + n < chars.len() && chars[from + n] == c {
         n += 1;
@@ -384,7 +323,7 @@ fn run_len(chars: &[char], from: usize, c: char) -> usize {
 }
 
 /// Find the next run of at least `len` `c`s starting at or after `from`.
-fn find_run(chars: &[char], from: usize, c: char, len: usize) -> Option<usize> {
+pub(crate) fn find_run(chars: &[char], from: usize, c: char, len: usize) -> Option<usize> {
     let mut k = from;
     while k + len <= chars.len() {
         if chars[k..k + len].iter().all(|&x| x == c) {
@@ -395,18 +334,18 @@ fn find_run(chars: &[char], from: usize, c: char, len: usize) -> Option<usize> {
     None
 }
 
-fn find_char(chars: &[char], from: usize, c: char) -> Option<usize> {
+pub(crate) fn find_char(chars: &[char], from: usize, c: char) -> Option<usize> {
     (from..chars.len()).find(|&k| chars[k] == c)
 }
 
 /// Whether `chars[i]` may open an emphasis span. Underscores are not allowed
 /// to open *inside* a word, so identifiers such as `snake_case` are left alone.
-fn can_open(chars: &[char], i: usize, c: char) -> bool {
+pub(crate) fn can_open(chars: &[char], i: usize, c: char) -> bool {
     c != '_' || i == 0 || !chars[i - 1].is_alphanumeric()
 }
 
 /// Find a closing emphasis run that is allowed to close the span at `from`.
-fn find_emph_close(chars: &[char], from: usize, c: char, len: usize) -> Option<usize> {
+pub(crate) fn find_emph_close(chars: &[char], from: usize, c: char, len: usize) -> Option<usize> {
     let mut k = from;
     while let Some(pos) = find_run(chars, k, c, len) {
         let closes_word = pos + len >= chars.len() || !chars[pos + len].is_alphanumeric();
@@ -418,8 +357,8 @@ fn find_emph_close(chars: &[char], from: usize, c: char, len: usize) -> Option<u
     None
 }
 
-/// Parse inline markup within a single line.
-fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
+/// Tag inline markup within a single line, keeping every character.
+pub(crate) fn inline(chars: &[char], base: MStyle) -> Vec<(char, MStyle)> {
     let n = chars.len();
     let mut out = Vec::with_capacity(n);
     let mut i = 0;
@@ -429,13 +368,8 @@ fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
 
         // Backslash escapes.
         if c == '\\' && i + 1 < n && chars[i + 1].is_ascii_punctuation() {
-            match mode {
-                Mode::Highlight => {
-                    out.push(('\\', MStyle::marker()));
-                    out.push((chars[i + 1], base));
-                }
-                Mode::Render => out.push((chars[i + 1], base)),
-            }
+            out.push(('\\', MStyle::marker()));
+            out.push((chars[i + 1], base));
             i += 2;
             continue;
         }
@@ -444,18 +378,12 @@ fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
         if c == '`' {
             let run = run_len(chars, i, '`');
             if let Some(close) = find_run(chars, i + run, '`', run) {
-                let inner = &chars[i + run..close];
-                match mode {
-                    Mode::Highlight => {
-                        for _ in 0..run {
-                            out.push(('`', MStyle::marker()));
-                        }
-                        push_styled(&mut out, inner, MStyle::code());
-                        for _ in 0..run {
-                            out.push(('`', MStyle::marker()));
-                        }
-                    }
-                    Mode::Render => push_styled(&mut out, inner, MStyle::code()),
+                for _ in 0..run {
+                    out.push(('`', MStyle::marker()));
+                }
+                push_styled(&mut out, &chars[i + run..close], MStyle::code());
+                for _ in 0..run {
+                    out.push(('`', MStyle::marker()));
                 }
                 i = close + run;
                 continue;
@@ -469,19 +397,12 @@ fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
             && can_open(chars, i, c)
             && let Some(close) = find_emph_close(chars, i + 2, c, 2)
         {
-            let inner = &chars[i + 2..close];
-            let style = base.with_bold();
-            match mode {
-                Mode::Highlight => {
-                    for _ in 0..2 {
-                        out.push((c, MStyle::marker()));
-                    }
-                    out.extend(inline(inner, style, mode));
-                    for _ in 0..2 {
-                        out.push((c, MStyle::marker()));
-                    }
-                }
-                Mode::Render => out.extend(inline(inner, style, mode)),
+            for _ in 0..2 {
+                out.push((c, MStyle::marker()));
+            }
+            out.extend(inline(&chars[i + 2..close], base.with_bold()));
+            for _ in 0..2 {
+                out.push((c, MStyle::marker()));
             }
             i = close + 2;
             continue;
@@ -492,16 +413,9 @@ fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
             && can_open(chars, i, c)
             && let Some(close) = find_emph_close(chars, i + 1, c, 1)
         {
-            let inner = &chars[i + 1..close];
-            let style = base.with_italic();
-            match mode {
-                Mode::Highlight => {
-                    out.push((c, MStyle::marker()));
-                    out.extend(inline(inner, style, mode));
-                    out.push((c, MStyle::marker()));
-                }
-                Mode::Render => out.extend(inline(inner, style, mode)),
-            }
+            out.push((c, MStyle::marker()));
+            out.extend(inline(&chars[i + 1..close], base.with_italic()));
+            out.push((c, MStyle::marker()));
             i = close + 1;
             continue;
         }
@@ -512,19 +426,12 @@ fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
             && chars[i + 1] == '~'
             && let Some(close) = find_run(chars, i + 2, '~', 2)
         {
-            let inner = &chars[i + 2..close];
-            let style = base.with_strike();
-            match mode {
-                Mode::Highlight => {
-                    for _ in 0..2 {
-                        out.push(('~', MStyle::marker()));
-                    }
-                    out.extend(inline(inner, style, mode));
-                    for _ in 0..2 {
-                        out.push(('~', MStyle::marker()));
-                    }
-                }
-                Mode::Render => out.extend(inline(inner, style, mode)),
+            for _ in 0..2 {
+                out.push(('~', MStyle::marker()));
+            }
+            out.extend(inline(&chars[i + 2..close], base.with_strike()));
+            for _ in 0..2 {
+                out.push(('~', MStyle::marker()));
             }
             i = close + 2;
             continue;
@@ -538,24 +445,15 @@ fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
                 && chars.get(close + 1) == Some(&'(')
                 && let Some(end) = find_char(chars, close + 2, ')')
             {
-                let text = &chars[text_start..close];
-                let url = &chars[close + 2..end];
-                match mode {
-                    Mode::Highlight => {
-                        if is_image {
-                            out.push(('!', MStyle::marker()));
-                        }
-                        out.push(('[', MStyle::marker()));
-                        out.extend(inline(text, MStyle::link(), mode));
-                        out.push((']', MStyle::marker()));
-                        out.push(('(', MStyle::marker()));
-                        push_styled(&mut out, url, MStyle::url());
-                        out.push((')', MStyle::marker()));
-                    }
-                    Mode::Render => {
-                        out.extend(inline(text, MStyle::link(), mode));
-                    }
+                if is_image {
+                    out.push(('!', MStyle::marker()));
                 }
+                out.push(('[', MStyle::marker()));
+                out.extend(inline(&chars[text_start..close], MStyle::link()));
+                out.push((']', MStyle::marker()));
+                out.push(('(', MStyle::marker()));
+                push_styled(&mut out, &chars[close + 2..end], MStyle::url());
+                out.push((')', MStyle::marker()));
                 i = end + 1;
                 continue;
             }
@@ -572,112 +470,131 @@ fn inline(chars: &[char], base: MStyle, mode: Mode) -> Vec<(char, MStyle)> {
 mod tests {
     use super::*;
 
-    fn text_of(line: &[(char, MStyle)]) -> String {
-        line.iter().map(|(c, _)| *c).collect()
-    }
-
     fn lines(input: &[&str]) -> Vec<String> {
         input.iter().map(|s| s.to_string()).collect()
     }
 
-    fn render(input: &[&str]) -> Vec<String> {
-        transform(&lines(input), Mode::Render, 10)
-            .iter()
-            .map(|l| text_of(l))
-            .collect()
+    fn text_of(line: &[(char, MStyle)]) -> String {
+        line.iter().map(|(c, _)| *c).collect()
     }
 
-    fn highlight(input: &[&str]) -> Vec<String> {
-        transform(&lines(input), Mode::Highlight, 10)
-            .iter()
-            .map(|l| text_of(l))
-            .collect()
+    fn highlighted(input: &[&str]) -> Vec<Vec<(char, MStyle)>> {
+        highlight(&lines(input))
     }
 
-    fn role_of(input: &str, needle: char) -> Role {
-        let out = transform(&lines(&[input]), Mode::Render, 10);
-        out[0]
-            .iter()
+    /// The role of the first character equal to `needle`.
+    fn role_in(input: &str, needle: char) -> Role {
+        let row = &highlighted(&[input])[0];
+        row.iter()
             .find(|(c, _)| *c == needle)
-            .map(|(_, s)| s.role)
+            .map(|(_, style)| style.role)
             .unwrap()
     }
 
+    fn style_in(input: &str, needle: char) -> MStyle {
+        let row = &highlighted(&[input])[0];
+        row.iter().find(|(c, _)| *c == needle).unwrap().1
+    }
+
+    /// The invariant everything else depends on: highlighting never changes the
+    /// text, so the caret can be positioned by character index.
     #[test]
-    fn highlight_preserves_source() {
-        let input = ["# Title", "some **bold** text", "- item"];
-        assert_eq!(highlight(&input), input);
+    fn highlighting_preserves_the_source_exactly() {
+        let input = [
+            "# Title",
+            "",
+            "Some **bold**, *italic*, `code` and ~~struck~~ text.",
+            "",
+            "- a bullet",
+            "1. a numbered item",
+            "> a quote",
+            "",
+            "```rust",
+            "let x = 1; // <code>",
+            "```",
+            "",
+            "---",
+            "",
+            "[a link](https://example.com) and ![an image](pic.png)",
+            r"an escaped \* star",
+        ];
+        let out = highlighted(&input);
+        let rebuilt: Vec<String> = out.iter().map(|row| text_of(row)).collect();
+        assert_eq!(rebuilt, input);
     }
 
     #[test]
-    fn render_strips_heading_hashes() {
-        assert_eq!(render(&["### Deep"]), vec!["Deep"]);
+    fn tags_headings_and_their_hashes() {
+        assert_eq!(role_in("### Deep", '#'), Role::HeadingMarker(3));
+        assert_eq!(role_in("### Deep", 'D'), Role::Heading(3));
     }
 
     #[test]
-    fn render_strips_inline_markers() {
-        assert_eq!(render(&["a **b** c"]), vec!["a b c"]);
-        assert_eq!(render(&["*i* and `code`"]), vec!["i and code"]);
-        assert_eq!(render(&["~~gone~~"]), vec!["gone"]);
+    fn tags_inline_markup() {
+        assert_eq!(role_in("a **b** c", '*'), Role::Marker);
+        assert_eq!(role_in("a **b** c", 'b'), Role::Text);
+        assert_eq!(role_in("`x`", 'x'), Role::Code);
+        assert_eq!(role_in("`x`", '`'), Role::Marker);
     }
 
     #[test]
-    fn render_keeps_link_text_drops_url() {
-        assert_eq!(render(&["see [docs](http://x)"]), vec!["see docs"]);
+    fn tags_blocks() {
+        assert_eq!(role_in("> quoted", '>'), Role::Marker);
+        assert_eq!(role_in("> quoted", 'q'), Role::Quote);
+        assert_eq!(role_in("- item", '-'), Role::List);
+        assert_eq!(role_in("- item", 'i'), Role::Text);
+        assert_eq!(role_in("1. item", '1'), Role::List);
+        assert_eq!(role_in("---", '-'), Role::Rule);
     }
 
     #[test]
-    fn render_turns_bullets_into_dots() {
-        assert_eq!(render(&["- a", "* b", "+ c"]), vec!["• a", "• b", "• c"]);
+    fn tags_fenced_code() {
+        let out = highlighted(&["```", "let x = 1;", "```"]);
+        assert_eq!(out[0][0].1.role, Role::Fence);
+        assert!(out[1].iter().all(|(_, s)| s.role == Role::Code));
+        assert_eq!(out[2][0].1.role, Role::Fence);
     }
 
     #[test]
-    fn render_keeps_ordered_numbers() {
-        assert_eq!(render(&["3. three"]), vec!["3. three"]);
-        assert_eq!(render(&["1) one"]), vec!["1) one"]);
-    }
-
-    #[test]
-    fn render_quotes_with_a_bar() {
-        assert_eq!(render(&["> hi"]), vec!["│ hi"]);
-    }
-
-    #[test]
-    fn rules_span_the_column() {
-        let out = render(&["---"]);
-        assert_eq!(out[0].chars().count(), 10);
-    }
-
-    #[test]
-    fn code_fence_drops_its_delimiters() {
-        let out = render(&["```", "let x = 1;", "```"]);
-        assert_eq!(out, vec!["", "│ let x = 1;", ""]);
-    }
-
-    #[test]
-    fn unmatched_markers_render_literally() {
-        assert_eq!(render(&["a * b"]), vec!["a * b"]);
-    }
-
-    #[test]
-    fn underscores_inside_words_are_literal() {
-        assert_eq!(render(&["call snake_case_now"]), vec!["call snake_case_now"]);
-    }
-
-    #[test]
-    fn roles_describe_the_syntax() {
-        assert_eq!(role_of("# hi", 'h'), Role::Heading(1));
-        assert_eq!(role_of("`x`", 'x'), Role::Code);
-        assert_eq!(role_of("> q", 'q'), Role::Quote);
-        assert_eq!(role_of("- i", 'i'), Role::Text);
-        assert_eq!(role_of("- i", '•'), Role::List);
+    fn tags_links_and_their_urls() {
+        let input = "[docs](http://x)";
+        assert_eq!(role_in(input, '['), Role::Marker);
+        assert_eq!(role_in(input, 'd'), Role::Link);
+        assert_eq!(role_in(input, 'h'), Role::Url);
     }
 
     #[test]
     fn emphasis_flags_reach_the_characters() {
-        let out = transform(&lines(&["**b**"]), Mode::Render, 10);
-        assert!(out[0][0].1.bold);
-        let out = transform(&lines(&["*i*"]), Mode::Render, 10);
-        assert!(out[0][0].1.italic);
+        assert!(style_in("**b**", 'b').bold);
+        assert!(style_in("*i*", 'i').italic);
+        assert!(style_in("~~s~~", 's').strike);
+    }
+
+    #[test]
+    fn code_spans_are_literal_inside_emphasis() {
+        // A code span takes the code role and does not inherit emphasis: what is
+        // inside backticks is literal.
+        let style = style_in("**bold `code`**", 'c');
+        assert_eq!(style.role, Role::Code);
+        assert!(!style.bold);
+    }
+
+    #[test]
+    fn underscores_inside_words_are_literal() {
+        assert_eq!(role_in("call snake_case_now", '_'), Role::Text);
+    }
+
+    #[test]
+    fn unmatched_markers_are_literal() {
+        let row = &highlighted(&["a * b"])[0];
+        // Nothing is marked up, so every character is body text.
+        assert!(row.iter().all(|(_, s)| s.role == Role::Text));
+    }
+
+    #[test]
+    fn escaped_punctuation_is_literal() {
+        let row = &highlighted(&[r"a \* b"])[0];
+        let star = row.iter().find(|(c, _)| *c == '*').unwrap();
+        assert_eq!(star.1.role, Role::Text);
     }
 }

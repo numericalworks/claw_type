@@ -11,13 +11,15 @@ use egui::{
     Align, Align2, Color32, FontId, Frame, Id, Key, Margin, Modifiers, Stroke, Vec2,
 };
 
-use crate::markdown::{MStyle, Mode, Role};
+use crate::markdown::{MStyle, Role};
 use crate::palette::{Rgb, Theme};
 
 mod fonts;
+mod html;
 mod lists;
 mod markdown;
 mod palette;
+mod preview;
 
 /// Base body text size, in points.
 const BODY_SIZE: f32 = 18.0;
@@ -82,12 +84,6 @@ fn parse_args() -> Option<PathBuf> {
 const EDITOR_ID: &str = "claw_type_editor";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum View {
-    Write,
-    Preview,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
 enum Modal {
     None,
     Help,
@@ -98,13 +94,17 @@ struct App {
     text: String,
     path: Option<PathBuf>,
     dirty: bool,
-    view: View,
     focus: bool,
     typewriter: bool,
     show_bar: bool,
     theme: Theme,
     status: Option<String>,
     modal: Modal,
+
+    /// The browser preview, once it has been started.
+    preview: Option<preview::Preview>,
+    /// The Markdown last handed to the preview, so we only re-render on change.
+    published: String,
 
     /// Line/column of the caret, refreshed each frame.
     cursor_line: usize,
@@ -128,13 +128,14 @@ impl App {
             text: String::new(),
             path: None,
             dirty: false,
-            view: View::Write,
             focus: false,
             typewriter: false,
             show_bar: true,
             theme,
             status: None,
             modal: Modal::None,
+            preview: None,
+            published: String::new(),
             cursor_line: 0,
             cursor_col: 0,
             focus_para: (0, 0),
@@ -210,6 +211,58 @@ impl App {
         self.status = Some(message);
     }
 
+    // -- preview ------------------------------------------------------------
+
+    /// Hand the preview the current document, if it has changed.
+    ///
+    /// Called every frame; converting and publishing only happens when the text
+    /// actually differs from what the browser already has.
+    fn sync_preview(&mut self) {
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        if self.text == self.published {
+            return;
+        }
+        preview.publish(&html::body(&self.text));
+        self.published.clone_from(&self.text);
+    }
+
+    /// Start the preview server if it is not already running.
+    ///
+    /// Returns whether a server is available. Split out from
+    /// [`App::open_preview`] so tests can start one without launching a
+    /// browser.
+    fn ensure_preview(&mut self) -> bool {
+        if self.preview.is_none() {
+            match preview::Preview::start(&self.theme) {
+                Some(preview) => {
+                    preview.publish(&html::body(&self.text));
+                    self.published.clone_from(&self.text);
+                    let url = preview.url().to_owned();
+                    self.preview = Some(preview);
+                    self.set_status(format!("Preview at {url}"));
+                }
+                None => {
+                    self.set_status("Could not start the preview server".to_owned());
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Start the preview server, if needed, and open it in the browser.
+    fn open_preview(&mut self) {
+        if !self.ensure_preview() {
+            return;
+        }
+        // Pressing the shortcut again re-opens the page, in case it was closed.
+        if let Some(Err(error)) = self.preview.as_ref().map(preview::Preview::open_in_browser) {
+            self.set_status(format!("Could not open a browser: {error}"));
+        }
+    }
+
     // -- fonts --------------------------------------------------------------
 
     /// Load a CJK font from the system the first time the document needs one.
@@ -253,13 +306,7 @@ impl App {
             self.new_file();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
-            self.view = match self.view {
-                View::Write => View::Preview,
-                View::Preview => View::Write,
-            };
-            if self.view == View::Write {
-                self.focus_requested = true;
-            }
+            self.open_preview();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
             self.focus = !self.focus;
@@ -275,18 +322,6 @@ impl App {
         }
         if help_shortcut_pressed(ctx) {
             self.modal = Modal::Help;
-        }
-
-        // Typing while looking at the preview returns you to the editor.
-        let typed = ctx.input(|i| {
-            i.raw
-                .events
-                .iter()
-                .any(|event| matches!(event, egui::Event::Text(text) if !text.is_empty()))
-        });
-        if self.view == View::Preview && typed {
-            self.view = View::Write;
-            self.focus_requested = true;
         }
 
         // Dropping a file onto the window opens it.
@@ -320,13 +355,8 @@ impl App {
     // -- layout -------------------------------------------------------------
 
     fn body(&mut self, ui: &mut egui::Ui) {
-        let scroll_id = match self.view {
-            View::Write => "write_scroll",
-            View::Preview => "preview_scroll",
-        };
-
         egui::ScrollArea::vertical()
-            .id_salt(scroll_id)
+            .id_salt("editor_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 let available = ui.available_width();
@@ -338,17 +368,14 @@ impl App {
                     ui.add_space(pad);
                     ui.vertical(|ui| {
                         ui.set_width(width);
-                        match self.view {
-                            View::Write => self.write_view(ui, width),
-                            View::Preview => self.preview_view(ui, width),
-                        }
+                        self.editor(ui, width);
                     });
                 });
                 ui.add_space(TOP_PAD);
             });
     }
 
-    fn write_view(&mut self, ui: &mut egui::Ui, width: f32) {
+    fn editor(&mut self, ui: &mut egui::Ui, width: f32) {
         let theme = self.theme;
         let focus = self.focus;
         let focus_para = self.focus_para;
@@ -451,37 +478,6 @@ impl App {
         }
     }
 
-    fn preview_view(&mut self, ui: &mut egui::Ui, width: f32) {
-        let theme = self.theme;
-        let lines: Vec<String> = self.text.split('\n').map(str::to_string).collect();
-        let rendered = markdown::transform(&lines, Mode::Render, 0);
-
-        ui.spacing_mut().item_spacing.y = 0.0;
-
-        for line in &rendered {
-            let only_rule = !line.is_empty() && line.iter().all(|(_, span)| span.role == Role::Rule);
-            if only_rule {
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
-                continue;
-            }
-            if line.is_empty() {
-                ui.add_space(BODY_SIZE * 0.85);
-                continue;
-            }
-
-            let heading = matches!(line.first().map(|(_, s)| s.role), Some(Role::Heading(_)));
-            if heading {
-                ui.add_space(BODY_SIZE * 0.6);
-            }
-            ui.add(egui::Label::new(preview_job(line, &theme, width)).wrap());
-            if heading {
-                ui.add_space(BODY_SIZE * 0.2);
-            }
-        }
-    }
-
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let theme = self.theme;
         let name = self
@@ -491,10 +487,6 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled.md".to_owned());
         let dot = if self.dirty { " ●" } else { "" };
-        let mode = match self.view {
-            View::Write => "WRITE",
-            View::Preview => "PREVIEW",
-        };
 
         let mut flags: Vec<&str> = Vec::new();
         if self.focus {
@@ -503,14 +495,17 @@ impl App {
         if self.typewriter {
             flags.push("typewriter");
         }
+        if self.preview.is_some() {
+            flags.push("preview");
+        }
         let flags = if flags.is_empty() {
             String::new()
         } else {
-            format!("  ·  {}", flags.join(" · "))
+            format!("  ·  {}", flags.join("  ·  "))
         };
 
         let mut text = format!(
-            "{name}{dot}  ·  {mode}  ·  {} words  ·  {} chars  ·  Ln {}/{}{flags}",
+            "{name}{dot}  ·  {} words  ·  {} chars  ·  Ln {}/{}{flags}",
             word_count(&self.text),
             self.text.chars().count(),
             self.cursor_line + 1,
@@ -563,7 +558,7 @@ impl App {
                             ("Cmd/Ctrl+O", "Open a file"),
                             ("Cmd/Ctrl+N", "New file"),
                             ("Cmd/Ctrl+Q", "Quit"),
-                            ("Cmd/Ctrl+P", "Toggle rendered preview"),
+                            ("Cmd/Ctrl+P", "Open the preview in your browser"),
                             ("Cmd/Ctrl+F", "Focus mode — dim other paragraphs"),
                             ("Cmd/Ctrl+T", "Typewriter scrolling"),
                             ("Cmd/Ctrl+B", "Show or hide the status bar"),
@@ -619,6 +614,7 @@ impl App {
         self.shortcuts(ui.ctx());
         self.guard_close(ui.ctx());
         self.maybe_load_cjk(ui.ctx());
+        self.sync_preview();
 
         if self.show_bar {
             egui::Panel::bottom("status_bar")
@@ -679,7 +675,7 @@ fn write_job(
     job.wrap.max_width = wrap_width;
 
     let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-    let tagged = markdown::transform(&lines, Mode::Highlight, 0);
+    let tagged = markdown::highlight(&lines);
 
     for (index, line) in tagged.iter().enumerate() {
         let dim = focus && !(index >= focus_para.0 && index <= focus_para.1);
@@ -689,14 +685,6 @@ fn write_job(
         }
     }
 
-    job
-}
-
-/// Build the layout for one rendered preview line.
-fn preview_job(line: &[(char, MStyle)], theme: &Theme, width: f32) -> LayoutJob {
-    let mut job = LayoutJob::default();
-    job.wrap.max_width = width;
-    push_runs(&mut job, line, |span| render_format(span, theme));
     job
 }
 
@@ -759,54 +747,6 @@ fn write_format(span: MStyle, theme: &Theme, dim: bool, font: &FontId) -> TextFo
         format.strikethrough = Stroke::new(1.0, color);
     }
     format
-}
-
-fn render_format(span: MStyle, theme: &Theme) -> TextFormat {
-    let (font, mut color) = match span.role {
-        Role::Heading(level) => (
-            FontId::proportional(heading_size(level)),
-            brighten(rgb(theme.role_color(span.role))),
-        ),
-        Role::HeadingMarker(_) | Role::Marker | Role::Fence => {
-            (FontId::proportional(BODY_SIZE), rgb(theme.marker))
-        }
-        Role::Code => (FontId::monospace(BODY_SIZE * 0.94), rgb(theme.code)),
-        Role::Quote => (FontId::proportional(BODY_SIZE), rgb(theme.quote)),
-        Role::List => (FontId::proportional(BODY_SIZE), rgb(theme.list)),
-        Role::Link => (FontId::proportional(BODY_SIZE), rgb(theme.link)),
-        Role::Url => (FontId::proportional(BODY_SIZE), rgb(theme.dim)),
-        Role::Rule => (FontId::monospace(BODY_SIZE), rgb(theme.rule)),
-        Role::Text => (FontId::proportional(BODY_SIZE), rgb(theme.fg)),
-    };
-
-    if span.bold {
-        color = brighten(color);
-    }
-
-    let mut format = TextFormat {
-        font_id: font,
-        color,
-        ..Default::default()
-    };
-    format.italics = span.italic;
-    if span.underline {
-        format.underline = Stroke::new(1.0, color);
-    }
-    if span.strike {
-        format.strikethrough = Stroke::new(1.0, color);
-    }
-    format
-}
-
-fn heading_size(level: u8) -> f32 {
-    match level {
-        1 => 30.0,
-        2 => 25.0,
-        3 => 21.0,
-        4 => BODY_SIZE + 1.0,
-        5 | 6 => BODY_SIZE,
-        _ => BODY_SIZE,
-    }
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -1300,21 +1240,78 @@ mod tests {
         let mut app = App::new(&ctx, None);
         app.text = "# தலைப்பு\n\nவாழ்க வையகம்\n".to_owned();
         frame(&ctx, &mut app, Vec::new());
-        app.view = View::Preview;
-        frame(&ctx, &mut app, Vec::new());
     }
 
     /// Drive the whole interface headlessly: this exercises the panels, the
-    /// `TextEdit` with its custom layouter, the fonts and the preview.
+    /// The preview server is started lazily and follows the document.
+    #[test]
+    fn the_preview_follows_the_document() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "# Title".to_owned();
+
+        // Starting directly avoids launching a browser from a test.
+        if !app.ensure_preview() {
+            eprintln!("cannot bind a loopback port here; skipping");
+            return;
+        }
+        let url = app.preview.as_ref().expect("server").url().to_owned();
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        assert_eq!(app.published, "# Title");
+
+        // A frame picks up edits and republishes them.
+        app.text = "# Title\n\nnew **text**".to_owned();
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.published, "# Title\n\nnew **text**");
+
+        // And the status bar says the preview is on.
+        assert!(app.status.as_deref().unwrap_or_default().contains("Preview at"), "{:?}", app.status);
+    }
+
+    /// The converted HTML is what the server actually serves.
+    #[test]
+    fn the_server_serves_the_converted_html() {
+        use std::io::{Read, Write};
+
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "# Title\n\nwith **bold**".to_owned();
+
+        if !app.ensure_preview() {
+            eprintln!("cannot bind a loopback port here; skipping");
+            return;
+        }
+        let url = app.preview.as_ref().expect("server").url().to_owned();
+        let address = url.trim_start_matches("http://").trim_end_matches('/');
+
+        let mut stream = std::net::TcpStream::connect(address).expect("connect");
+        write!(stream, "GET /content HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+
+        assert!(response.contains("X-Version: 1"), "{response}");
+        assert!(response.contains("<h1>Title</h1>"), "{response}");
+        assert!(response.contains("<strong>bold</strong>"), "{response}");
+    }
+
+    /// Without a preview there is nothing to publish.
+    #[test]
+    fn nothing_is_published_until_the_preview_is_opened() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "# Title".to_owned();
+        frame(&ctx, &mut app, Vec::new());
+        assert!(app.preview.is_none());
+        assert!(app.published.is_empty());
+    }
+
+    /// `TextEdit` with its custom layouter, the fonts and the panels.
     #[test]
     fn draws_a_frame_without_panicking() {
         let ctx = egui::Context::default();
         let mut app = App::new(&ctx, None);
         app.text = "# Hello\n\nsome **bold** and `code` text\n\n- one\n- two\n\n> quote".to_owned();
 
-        frame(&ctx, &mut app, Vec::new());
-
-        app.view = View::Preview;
         frame(&ctx, &mut app, Vec::new());
 
         app.focus = true;
