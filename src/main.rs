@@ -1,8 +1,6 @@
 //! `claw_type` — a distraction-free Markdown editor for the desktop.
 //!
-//! A window, a single centred column of text, and nothing else. The Markdown
-//! engine and palette are shared with the terminal front-end via the
-//! `claw_type` library.
+//! A window, a single centred column of text, and nothing else.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,11 +11,13 @@ use egui::{
     Align, Align2, Color32, FontId, Frame, Id, Key, Margin, Modifiers, Stroke, Vec2,
 };
 
-use claw_type::buffer;
-use claw_type::markdown::{self, MStyle, Mode, Role};
-use claw_type::palette::{Rgb, Theme};
+use crate::markdown::{MStyle, Mode, Role};
+use crate::palette::{Rgb, Theme};
 
 mod fonts;
+mod lists;
+mod markdown;
+mod palette;
 
 /// Base body text size, in points.
 const BODY_SIZE: f32 = 18.0;
@@ -662,6 +662,7 @@ fn configure(ctx: &egui::Context, theme: &Theme) {
     visuals.selection.stroke = Stroke::new(1.0, rgb(theme.accent));
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, rgb(theme.border));
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, rgb(theme.border));
+    visuals.text_cursor.stroke = Stroke::new(2.0, rgb(theme.accent));
     ctx.set_visuals(visuals);
 }
 
@@ -859,16 +860,16 @@ fn continue_list(text: &mut String, caret: usize) -> Option<usize> {
         .unwrap_or(0);
     let before_caret: String = chars[line_start..caret].iter().collect();
 
-    match buffer::list_continuation(&before_caret) {
-        buffer::Continuation::None => None,
-        buffer::Continuation::Prefix(prefix) => {
+    match lists::continuation(&before_caret) {
+        lists::Continuation::None => None,
+        lists::Continuation::Prefix(prefix) => {
             // The newline Enter added sits at `caret`; the marker follows it.
             let insert_at = caret + 1;
             let byte = byte_index(text, insert_at);
             text.insert_str(byte, &prefix);
             Some(insert_at + prefix.chars().count())
         }
-        buffer::Continuation::Clear => {
+        lists::Continuation::Clear => {
             // The line held only a marker, so this Enter ends the list: drop the
             // marker *and* the newline the editor just added, leaving one empty
             // line. `caret` is the newline, so removing up to `caret + 1` keeps

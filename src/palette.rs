@@ -1,9 +1,8 @@
-//! The shared colour palette.
+//! The colour palette.
 //!
-//! Colours are stored as plain RGB triples so that both front-ends can convert
-//! them: the terminal maps them to `ratatui::style::Color::Rgb`, the window
-//! maps them to `egui::Color32`. Semantic roles are resolved to colours here,
-//! which keeps the Markdown parser free of any appearance concerns.
+//! Colours are stored as plain RGB triples and converted where they are used.
+//! Semantic roles are resolved to colours here, which keeps the Markdown parser
+//! free of any appearance concerns.
 
 use crate::markdown::Role;
 
@@ -41,9 +40,6 @@ pub struct Theme {
     /// Panels drawn on top of the editor.
     pub overlay_bg: Rgb,
     pub border: Rgb,
-    /// The block cursor.
-    pub cursor_fg: Rgb,
-    pub cursor_bg: Rgb,
 }
 
 impl Default for Theme {
@@ -71,8 +67,6 @@ impl Default for Theme {
             bar_bg: (0x11, 0x13, 0x18),
             overlay_bg: (0x1e, 0x22, 0x2a),
             border: (0x3a, 0x40, 0x4b),
-            cursor_fg: (0x17, 0x1a, 0x20),
-            cursor_bg: (0x62, 0xa9, 0xf5),
         }
     }
 }

@@ -1,27 +1,15 @@
 # claw_type
 
-A distraction-free Markdown editor — a native window on your desktop, and an
-optional terminal front-end.
+A distraction-free Markdown editor for the desktop.
 
 `claw_type` keeps only your words on screen: one narrow, centred writing column,
 no toolbars, no menus. Markdown stays visible as you write — coloured, not
 hidden — and a rendered preview is one keystroke away.
 
 ```sh
-cargo run --release              # the desktop app
+cargo run --release              # the editor
 cargo run --release -- notes.md  # …opening a file
-cargo run --release --bin tui    # the terminal version
 ```
-
-## Two front-ends, one engine
-
-Both front-ends share the same Markdown parser and colour palette, so they render
-identically.
-
-| Binary | What it is |
-| --- | --- |
-| `claw_type` (default) | A native window built with [`egui`/`eframe`](https://github.com/emilk/egui) |
-| `tui` | A terminal editor built with [`ratatui`](https://github.com/ratatui/ratatui), for SSH or a plain console |
 
 ## Features
 
@@ -45,8 +33,8 @@ identically.
   an empty item drops its marker to end the list.
 - **Guard rails.** Closing the window with unsaved changes, or quitting with
   `Cmd/Ctrl+Q`, asks before discarding work.
-- **Non-ASCII text is measured properly** — CJK characters are counted by
-  display width, not by byte length.
+- **Unicode throughout.** Text is edited by character rather than by byte, and
+  non-Latin scripts render properly (see *Scripts and fonts*).
 
 ## Scripts and fonts
 
@@ -77,9 +65,6 @@ To add a script, drop its font in `assets/fonts/` and add a line to `BUNDLED` in
 The bundled fonts are from <https://github.com/notofonts/noto-fonts>, licensed
 under the SIL Open Font License 1.1 (`assets/fonts/LICENSE-OFL.txt`).
 
-The terminal front-end cannot choose a font — it relies on your terminal
-emulator's, so install a suitable font there if you need one.
-
 ## Key bindings
 
 | Key | Action |
@@ -96,33 +81,22 @@ emulator's, so install a suitable font there if you need one.
 | `Cmd/Ctrl+H` or `F1` | Shortcut help |
 | `Esc` | Close a panel |
 
-The terminal front-end has the same bindings (its status bar also toggles with
-`F2`), plus soft wrapping with cursor movement by screen row. Both front-ends
-share the same list-continuation logic, so `Enter` behaves identically in each.
-
 ## Design
 
-The crate is a small library plus one binary per front-end:
+The crate is a single binary with small, focused modules:
 
 | Path | Responsibility |
 | --- | --- |
+| `src/main.rs` | The window: layout jobs, shortcuts, panels, file dialogs |
 | `src/markdown.rs` | Parses Markdown into *semantically tagged* characters |
-| `src/palette.rs` | The shared colours, stored as plain RGB |
-| `src/buffer.rs` | The text model: lines, cursor, editing, undo history, list continuation |
-| `src/wrap.rs` | Display-width-aware soft wrapping and row mapping |
-| `src/tui/` | The terminal front-end (app state, drawing, `ratatui` styling) |
-| `src/main.rs` | The windowed front-end (layout jobs, shortcuts, dialogs) |
+| `src/palette.rs` | The colour palette, stored as plain RGB |
+| `src/lists.rs` | Bullet / numbered / quote continuation on Enter |
+| `src/fonts.rs` | Bundled Noto Sans, plus lazy loading of a system CJK font |
 
 The key idea is that the Markdown parser emits, per character, a `Role`
-(heading, code, marker, link, …) rather than a colour. Each front-end maps those
-roles onto its own styling — `ratatui::style::Style` in one, `egui`'s
-`TextFormat` in the other — from the same palette. Adding a third front-end
-would only mean writing another mapping.
-
-In the terminal front-end there is a further split between the *logical*
-document (lines and `char` offsets) and the *visual* rows it is drawn as:
-`wrap.rs` produces those rows and remembers which character each row starts at,
-which is what lets the cursor sit correctly on a wrapped line.
+(heading, code, marker, link, …) rather than a colour; the window maps those
+roles onto `egui`'s `TextFormat` using the shared palette. Adding another
+front-end would mean writing another mapping, not another parser.
 
 ## Tests
 
@@ -130,8 +104,8 @@ which is what lets the cursor sit correctly on a wrapped line.
 cargo test
 ```
 
-The suite covers editing and undo, list continuation, wrapping (including wide
-characters), the Markdown parser, headless frame rendering for the terminal via
-Ratatui's `TestBackend`, and the windowed front-end's text layout (that the
-highlighted layout is byte-for-byte identical to the source, so the caret never
-drifts).
+The suite covers the Markdown parser, list continuation, the bundled fonts and
+their script coverage, and the editor itself — including headless frames driven
+through an `egui::Context` (that the highlighted layout is byte-for-byte
+identical to the source, so the caret never drifts, and that pressing Enter
+continues a list while ordinary typing does not).
