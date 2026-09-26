@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use eframe::egui;
-use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
+use egui::text::{ByteIndex, CCursor, CCursorRange, LayoutJob, LayoutSection, TextFormat};
 use egui::widgets::text_edit::TextEditState;
 use egui::{
     Align, Align2, Color32, FontId, Frame, Id, Key, Margin, Modifiers, Stroke, Vec2,
@@ -126,6 +126,118 @@ enum AiStatus {
     Failed(String),
 }
 
+/// The find-and-replace bar: what to look for, and where the search has got to.
+#[derive(Default)]
+struct Find {
+    /// Whether the bar is showing.
+    open: bool,
+    /// What to look for.
+    query: String,
+    /// What to put in its place.
+    replacement: String,
+    /// Match the query's case exactly; otherwise ASCII case is ignored.
+    case_sensitive: bool,
+    /// Every occurrence in the document, as character ranges.
+    matches: Vec<(usize, usize)>,
+    /// Which of `matches` the search is on.
+    current: usize,
+    /// Recompute `matches` before they are next used.
+    stale: bool,
+    /// Ask the query field for keyboard focus on the next frame.
+    focus_query: bool,
+    /// Scroll the current match into view on the next frame.
+    scroll: bool,
+    /// Where to carry on from when `matches` are recomputed, if not the caret.
+    resume: Option<usize>,
+}
+
+impl Find {
+    /// Recompute the matches if the document or the query has changed.
+    ///
+    /// The current match becomes the first one at or after the caret (or after
+    /// a replacement), which is where a fresh search should begin.
+    fn refresh(&mut self, text: &str, caret: usize) {
+        if !self.stale {
+            return;
+        }
+        self.stale = false;
+        self.matches = find_matches(text, &self.query, self.case_sensitive);
+        let anchor = self.resume.take().unwrap_or(caret);
+        self.current = if self.matches.is_empty() {
+            0
+        } else {
+            self.matches
+                .iter()
+                .position(|&(start, _)| start >= anchor)
+                .unwrap_or(0)
+        };
+    }
+
+    fn current_range(&self) -> Option<(usize, usize)> {
+        self.matches.get(self.current).copied()
+    }
+
+    /// How the search is going, for the label between the buttons.
+    fn summary(&self) -> String {
+        if self.query.is_empty() {
+            String::new()
+        } else if self.matches.is_empty() {
+            "No matches".to_owned()
+        } else {
+            format!("{} of {}", self.current + 1, self.matches.len())
+        }
+    }
+
+    fn next(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + 1) % self.matches.len();
+            self.scroll = true;
+        }
+    }
+
+    fn previous(&mut self) {
+        if !self.matches.is_empty() {
+            self.current = (self.current + self.matches.len() - 1) % self.matches.len();
+            self.scroll = true;
+        }
+    }
+
+    /// Put the replacement over the current match, then carry on after it.
+    fn replace_current(&mut self, text: &mut String) {
+        let Some((start, end)) = self.current_range() else {
+            return;
+        };
+        *text = ai::splice(text, (start, end), &self.replacement);
+        self.resume = Some(start + self.replacement.chars().count());
+        self.stale = true;
+    }
+
+    /// Replace every match at once; returns how many there were.
+    fn replace_all(&mut self, text: &mut String) -> usize {
+        if self.matches.is_empty() {
+            return 0;
+        }
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::new();
+        let mut last = 0;
+        for &(start, end) in &self.matches {
+            // Defensive: the matches should be current, but never index past the
+            // text even if something slipped through.
+            let start = start.clamp(last, chars.len());
+            let end = end.clamp(start, chars.len());
+            out.extend(&chars[last..start]);
+            out.push_str(&self.replacement);
+            last = end;
+        }
+        out.extend(&chars[last..]);
+        let count = self.matches.len();
+        *text = out;
+        self.resume = None;
+        self.stale = true;
+        count
+    }
+}
+
 /// The AI panel: the action being run, and the answer as it arrives.
 #[derive(Default)]
 struct Ai {
@@ -188,6 +300,8 @@ struct App {
 
     /// The AI panel.
     ai: Ai,
+    /// The find-and-replace bar.
+    find: Find,
     /// The current selection, if any, in character offsets.
     selection: Option<(usize, usize)>,
 
@@ -229,6 +343,7 @@ impl App {
             connection: Connection::NotConnected,
             connecting: None,
             ai: Ai::default(),
+            find: Find::default(),
             selection: None,
             preview: None,
             published: String::new(),
@@ -427,8 +542,15 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::P)) {
             self.open_preview();
         }
-        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+        // Cmd/Ctrl+Shift+F toggles focus mode; plain Cmd/Ctrl+F finds and
+        // replaces, as it does almost everywhere else. The shifted chord is
+        // checked first because a plain-command match also accepts extra
+        // modifiers.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::F)) {
             self.focus = !self.focus;
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::F)) {
+            self.toggle_find();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::T)) {
             self.typewriter = !self.typewriter;
@@ -449,6 +571,11 @@ impl App {
         }
         if help_shortcut_pressed(ctx) {
             self.modal = Modal::Help;
+        }
+
+        // Esc closes the find bar, wherever the focus happens to be.
+        if self.find.open && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.close_find();
         }
 
         // Dropping a file onto the window opens it.
@@ -518,12 +645,20 @@ impl App {
         let focus = self.focus;
         let focus_para = self.focus_para;
         let font = FontId::proportional(BODY_SIZE);
+        let search_bg = rgb(theme.search);
+        let search_hit_bg = rgb(theme.search_hit);
+        // The layouter cannot borrow `self` while the document is borrowed
+        // mutably, so the matches are copied out — only while the bar is open.
+        let search = self
+            .find
+            .open
+            .then(|| (self.find.matches.clone(), self.find.current));
 
         let mut layouter = |ui: &egui::Ui,
                             buffer: &dyn egui::widgets::TextBuffer,
                             wrap_width: f32|
          -> Arc<egui::Galley> {
-            let job = write_job(
+            let mut job = write_job(
                 buffer.as_str(),
                 &theme,
                 focus,
@@ -531,6 +666,9 @@ impl App {
                 font.clone(),
                 wrap_width,
             );
+            if let Some((matches, current)) = &search {
+                paint_matches(&mut job, matches, *current, search_bg, search_hit_bg);
+            }
             ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
         };
 
@@ -614,6 +752,8 @@ impl App {
         if response.changed() {
             self.dirty = true;
             self.status = None;
+            // The document moved under the search, so its matches are stale.
+            self.find.stale = true;
         }
 
         // Typewriter scrolling: keep the caret vertically centred, but only
@@ -628,6 +768,21 @@ impl App {
             let rect =
                 egui::Rect::from_min_size(output.galley_pos + local.min.to_vec2(), local.size());
             ui.scroll_to_rect(rect, Some(Align::Center));
+        }
+
+        // Bring the current find match into view when the search moved to it.
+        if self.find.open && self.find.scroll {
+            if let Some((start, end)) = self.find.current_range() {
+                let from = output.galley.pos_from_cursor(CCursor::new(start));
+                let to = output.galley.pos_from_cursor(CCursor::new(end));
+                let local = from.union(to);
+                let rect = egui::Rect::from_min_size(
+                    output.galley_pos + local.min.to_vec2(),
+                    local.size(),
+                );
+                ui.scroll_to_rect(rect, Some(Align::Center));
+            }
+            self.find.scroll = false;
         }
     }
 
@@ -708,7 +863,7 @@ impl App {
                     .num_columns(2)
                     .spacing([18.0, 6.0])
                     .show(ui, |ui| {
-                        let rows: [(&str, &str); 15] = [
+                        let rows: [(&str, &str); 16] = [
                             ("Cmd/Ctrl+S", "Save"),
                             ("Cmd/Ctrl+O", "Open a file"),
                             ("Cmd/Ctrl+N", "New file"),
@@ -716,7 +871,8 @@ impl App {
                             ("Cmd/Ctrl+P", "Open the preview in your browser"),
                             ("Cmd/Ctrl+,", "Settings for Ollama"),
                             ("Cmd/Ctrl+I", "AI: explain, summarise, rephrase, proofread"),
-                            ("Cmd/Ctrl+F", "Focus mode — dim other paragraphs"),
+                            ("Cmd/Ctrl+F", "Find and replace"),
+                            ("Shift+Cmd/Ctrl+F", "Focus mode — dim other paragraphs"),
                             ("Cmd/Ctrl+T", "Typewriter scrolling"),
                             ("Cmd/Ctrl+B", "Show or hide the status bar"),
                             ("Cmd/Ctrl+Z", "Undo"),
@@ -1266,6 +1422,119 @@ impl App {
         }
     }
 
+    // -- find and replace ---------------------------------------------------
+
+    /// Open the find bar, or close it if it is already open.
+    fn toggle_find(&mut self) {
+        if self.find.open {
+            self.close_find();
+        } else {
+            self.open_find();
+        }
+    }
+
+    fn open_find(&mut self) {
+        self.find.open = true;
+        self.find.focus_query = true;
+        self.find.stale = true;
+        self.find.resume = None;
+
+        // Start from the selection, as most editors do, when it is a single line.
+        if let Some((start, end)) = self.selection {
+            let chars: Vec<char> = self.text.chars().collect();
+            let start = start.min(chars.len());
+            let end = end.min(chars.len());
+            let picked: String = chars[start..end].iter().collect();
+            if !picked.is_empty() && !picked.contains('\n') {
+                self.find.query = picked;
+                self.find.resume = Some(start);
+            }
+        }
+    }
+
+    fn close_find(&mut self) {
+        self.find.open = false;
+        self.find.scroll = false;
+        self.find.focus_query = false;
+    }
+
+    /// The find-and-replace bar along the bottom of the window.
+    fn find_bar(&mut self, ui: &mut egui::Ui) {
+        let theme = self.theme;
+        let dim = rgb(theme.dim);
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Find").size(12.0).color(dim));
+            let query = ui.add(
+                egui::TextEdit::singleline(&mut self.find.query)
+                    .id(Id::new("claw_type_find"))
+                    .desired_width(220.0)
+                    .hint_text("Find…"),
+            );
+            if self.find.focus_query {
+                query.request_focus();
+                self.find.focus_query = false;
+            }
+            if query.changed() {
+                self.find.stale = true;
+                self.find.resume = None;
+                self.find.scroll = true;
+            }
+            if query.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                self.find.next();
+            }
+
+            ui.label(egui::RichText::new(self.find.summary()).size(11.0).color(dim));
+
+            let has = !self.find.matches.is_empty();
+            if ui.add_enabled(has, egui::Button::new("Previous")).clicked() {
+                self.find.previous();
+            }
+            if ui.add_enabled(has, egui::Button::new("Next")).clicked() {
+                self.find.next();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Replace").size(12.0).color(dim));
+            let replacement = ui.add(
+                egui::TextEdit::singleline(&mut self.find.replacement)
+                    .id(Id::new("claw_type_replace"))
+                    .desired_width(220.0)
+                    .hint_text("Replace with…"),
+            );
+
+            let has = !self.find.matches.is_empty();
+            let enter = replacement.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let clicked = ui.add_enabled(has, egui::Button::new("Replace")).clicked();
+            if enter || clicked {
+                self.find.replace_current(&mut self.text);
+                self.dirty = true;
+            }
+
+            if ui
+                .add_enabled(has, egui::Button::new("Replace all"))
+                .clicked()
+            {
+                let count = self.find.replace_all(&mut self.text);
+                self.dirty = true;
+                self.status = Some(format!("Replaced {count}"));
+            }
+
+            if ui
+                .checkbox(&mut self.find.case_sensitive, "Match case")
+                .changed()
+            {
+                self.find.stale = true;
+                self.find.resume = None;
+            }
+
+            if ui.button("Close").clicked() {
+                self.close_find();
+            }
+        });
+    }
+
     /// Draw the whole interface into `ui`.
     ///
     /// Split out from the [`eframe::App`] implementation so it can be driven
@@ -1277,6 +1546,10 @@ impl App {
         self.maybe_load_cjk(ui.ctx());
         self.sync_preview();
 
+        // Work out the matches before anything draws them, so a document edit
+        // from the last frame cannot be replaced against stale offsets.
+        self.find.refresh(&self.text, self.prev_cursor.unwrap_or(0));
+
         if self.show_bar {
             egui::Panel::bottom("status_bar")
                 .frame(
@@ -1286,6 +1559,19 @@ impl App {
                 )
                 .show(ui, |ui| self.status_bar(ui));
         }
+
+        if self.find.open {
+            egui::Panel::bottom("find_bar")
+                .frame(
+                    Frame::NONE
+                        .fill(rgb(theme.bar_bg))
+                        .inner_margin(Margin::symmetric(18, 7)),
+                )
+                .show(ui, |ui| self.find_bar(ui));
+        }
+
+        // A query or a replacement typed just now changes the matches too.
+        self.find.refresh(&self.text, self.prev_cursor.unwrap_or(0));
 
         egui::CentralPanel::default()
             .frame(Frame::NONE.fill(rgb(theme.bg)))
@@ -1410,6 +1696,100 @@ fn write_format(span: MStyle, theme: &Theme, dim: bool, font: &FontId) -> TextFo
         format.strikethrough = Stroke::new(1.0, color);
     }
     format
+}
+
+// -- search ----------------------------------------------------------------
+
+/// Every non-overlapping occurrence of `query` in `text`, as character ranges.
+///
+/// Case is ignored unless `case_sensitive`, but the folding is ASCII-only, so a
+/// query in a non-Latin script matches only itself.
+fn find_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    let haystack: Vec<char> = text.chars().collect();
+    let needle: Vec<char> = query.chars().collect();
+    let mut found = Vec::new();
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return found;
+    }
+    let same = |a: char, b: char| {
+        if case_sensitive {
+            a == b
+        } else {
+            a.eq_ignore_ascii_case(&b)
+        }
+    };
+
+    let mut start = 0;
+    while start + needle.len() <= haystack.len() {
+        if needle
+            .iter()
+            .enumerate()
+            .all(|(offset, &want)| same(haystack[start + offset], want))
+        {
+            found.push((start, start + needle.len()));
+            start += needle.len(); // non-overlapping
+        } else {
+            start += 1;
+        }
+    }
+    found
+}
+
+/// Tint the parts of `job` that `matches` cover, picking out the current one.
+///
+/// The job is built from the same characters as the document — a tab becomes a
+/// single space — so a character offset maps straight onto its own byte offset.
+fn paint_matches(
+    job: &mut LayoutJob,
+    matches: &[(usize, usize)],
+    current: usize,
+    all: Color32,
+    hit: Color32,
+) {
+    if matches.is_empty() {
+        return;
+    }
+
+    let text = std::mem::take(&mut job.text);
+    let ranges: Vec<(usize, usize)> = matches
+        .iter()
+        .map(|&(start, end)| (byte_index(&text, start), byte_index(&text, end)))
+        .collect();
+
+    let sections = std::mem::take(&mut job.sections);
+    for section in sections {
+        let (start, end) = (section.byte_range.start.0, section.byte_range.end.0);
+        let mut cuts = vec![start];
+        for &(match_start, match_end) in &ranges {
+            if match_start > start && match_start < end {
+                cuts.push(match_start);
+            }
+            if match_end > start && match_end < end {
+                cuts.push(match_end);
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        cuts.push(end);
+
+        for pair in cuts.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a >= b {
+                continue;
+            }
+            let mut format = section.format.clone();
+            if let Some(index) = ranges.iter().position(|&(s, e)| s <= a && b <= e) {
+                format.background = if index == current { hit } else { all };
+            }
+            job.sections.push(LayoutSection {
+                leading_space: section.leading_space,
+                byte_range: ByteIndex(a)..ByteIndex(b),
+                format,
+            });
+        }
+    }
+
+    job.text = text;
 }
 
 // -- helpers ----------------------------------------------------------------
@@ -2165,5 +2545,148 @@ mod tests {
             .ai_subject(AiAction::ProofreadDocument)
             .expect("a document");
         assert_eq!(range, (0, app.text.chars().count()));
+    }
+
+    /// Matches are non-overlapping, so "aa" appears once in "aaa".
+    #[test]
+    fn find_matches_finds_every_occurrence() {
+        assert_eq!(find_matches("aaa", "aa", true), vec![(0, 2)]);
+        assert_eq!(find_matches("one two one", "one", true), vec![(0, 3), (8, 11)]);
+        assert_eq!(find_matches("abc", "", true), vec![]);
+        assert_eq!(find_matches("", "a", true), vec![]);
+        assert_eq!(find_matches("a b", "ab", true), vec![]);
+    }
+
+    /// Case is ignored unless asked for, and the folding is ASCII-only.
+    #[test]
+    fn find_matches_ignores_case_unless_asked() {
+        assert_eq!(find_matches("AaA", "a", false), vec![(0, 1), (1, 2), (2, 3)]);
+        assert_eq!(find_matches("AaA", "a", true), vec![(1, 2)]);
+        assert_eq!(find_matches("hello", "HELLO", false), vec![(0, 5)]);
+        assert_eq!(find_matches("hello", "HELLO", true), vec![]);
+    }
+
+    /// The tint lands on the right bytes even around a multi-byte character, and
+    /// the current match is picked out from the rest.
+    #[test]
+    fn matches_are_tinted_in_the_layout() {
+        let theme = Theme::default();
+        let all = Color32::from_rgb(1, 2, 3);
+        let hit = Color32::from_rgb(4, 5, 6);
+
+        let source = "café café";
+        let mut job = write_job(
+            source,
+            &theme,
+            false,
+            (0, 0),
+            FontId::proportional(BODY_SIZE),
+            400.0,
+        );
+        // "café" is characters 0..4 and 5..9; the second one is current.
+        paint_matches(&mut job, &[(0, 4), (5, 9)], 1, all, hit);
+
+        // The sections still cover the text with no gaps.
+        let mut cursor = 0;
+        for section in &job.sections {
+            assert_eq!(section.byte_range.start.0, cursor);
+            cursor = section.byte_range.end.0;
+        }
+        assert_eq!(cursor, job.text.len());
+
+        let background = |byte: usize| {
+            job.sections
+                .iter()
+                .find(|section| {
+                    section.byte_range.start.0 <= byte && byte < section.byte_range.end.0
+                })
+                .expect("byte is covered")
+                .format
+                .background
+        };
+        assert_eq!(background(0), all, "the first match");
+        assert_eq!(background(3), all, "inside the first match's é");
+        assert_eq!(background(5), Color32::TRANSPARENT, "the gap between");
+        assert_eq!(background(6), hit, "the current match");
+        assert_eq!(background(job.text.len() - 1), hit, "its final byte");
+    }
+
+    /// Cmd/Ctrl+F opens the find bar, and Esc closes it again.
+    #[test]
+    fn cmd_f_opens_find_and_escape_closes_it() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        frame(&ctx, &mut app, Vec::new()); // let the editor settle first
+
+        frame(&ctx, &mut app, key(Key::F, Modifiers::COMMAND));
+        assert!(app.find.open, "Cmd+F should open the find bar");
+
+        frame(&ctx, &mut app, key(Key::Escape, Modifiers::NONE));
+        assert!(!app.find.open, "Esc should close the find bar");
+    }
+
+    /// Typing into the query field finds the matches as you go.
+    #[test]
+    fn typing_a_query_finds_matches() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "one two one".to_owned();
+        frame(&ctx, &mut app, Vec::new()); // let the editor settle first
+
+        frame(&ctx, &mut app, key(Key::F, Modifiers::COMMAND));
+        for ch in "one".chars() {
+            frame(&ctx, &mut app, text_event(&ch.to_string()));
+        }
+        assert_eq!(app.find.query, "one");
+        assert_eq!(app.find.matches, vec![(0, 3), (8, 11)]);
+    }
+
+    /// Replacing moves through the matches, and replacing all does them at once.
+    #[test]
+    fn replace_replaces_one_and_all() {
+        let mut find = Find {
+            query: "one".to_owned(),
+            replacement: "1".to_owned(),
+            stale: true,
+            ..Find::default()
+        };
+
+        let mut text = "one two one".to_owned();
+        find.refresh(&text, 0);
+        assert_eq!(find.matches, vec![(0, 3), (8, 11)]);
+
+        find.replace_current(&mut text);
+        assert_eq!(text, "1 two one");
+        find.refresh(&text, 0);
+        find.replace_current(&mut text);
+        assert_eq!(text, "1 two 1");
+
+        let mut text = "a a a".to_owned();
+        find.query = "a".to_owned();
+        find.replacement = "b".to_owned();
+        find.stale = true;
+        find.resume = None;
+        find.refresh(&text, 0);
+        assert_eq!(find.replace_all(&mut text), 3);
+        assert_eq!(text, "b b b");
+    }
+
+    /// Moving through the matches wraps around at either end.
+    #[test]
+    fn next_and_previous_wrap_around() {
+        let mut find = Find {
+            query: "x".to_owned(),
+            matches: vec![(0, 1), (5, 6), (9, 10)],
+            ..Find::default()
+        };
+        assert_eq!(find.summary(), "1 of 3");
+
+        find.next();
+        find.next();
+        find.next();
+        assert_eq!(find.current, 0, "next wraps around");
+
+        find.previous();
+        assert_eq!(find.current, 2, "previous wraps back");
     }
 }

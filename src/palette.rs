@@ -65,6 +65,10 @@ pub struct Theme {
     /// Panels drawn on top of the editor.
     pub overlay_bg: Rgb,
     pub border: Rgb,
+    /// Background behind every find match.
+    pub search: Rgb,
+    /// Background behind the find match the search is on.
+    pub search_hit: Rgb,
     /// Colours for code inside the preview page.
     pub syntax: Syntax,
 }
@@ -95,6 +99,8 @@ impl Default for Theme {
             bar_bg: (0x11, 0x13, 0x18),
             overlay_bg: (0x1e, 0x22, 0x2a),
             border: (0x3a, 0x40, 0x4b),
+            search: (0x46, 0x42, 0x24),
+            search_hit: (0x8f, 0x76, 0x28),
             syntax: Syntax {
                 comment: (0x5c, 0x63, 0x70),
                 keyword: (0xc6, 0x78, 0xdd),
@@ -135,6 +141,8 @@ impl Theme {
             bar_bg: (0xf0, 0xf1, 0xf3),
             overlay_bg: (0xff, 0xff, 0xff),
             border: (0xd8, 0xdc, 0xe2),
+            search: (0xff, 0xf3, 0xb8),
+            search_hit: (0xff, 0xd1, 0x4d),
             syntax: Syntax {
                 comment: (0x8a, 0x92, 0x9e),
                 keyword: (0x76, 0x3a, 0xa0),

@@ -15,10 +15,14 @@ cargo run --release -- notes.md  # …opening a file
 
 - **Centred writing column.** The text stays in a comfortable reading measure
   however wide the window is.
-- **Focus mode** (`Cmd/Ctrl+F`). Every paragraph except the one you are in fades
-  into the background.
+- **Focus mode** (`Shift+Cmd/Ctrl+F`). Every paragraph except the one you are in
+  fades into the background.
 - **Typewriter scrolling** (`Cmd/Ctrl+T`). Keeps the line you are editing
   vertically centred.
+- **Find and replace** (`Cmd/Ctrl+F`). A bar along the bottom of the window
+  finds as you type, tints every match in the text and steps through them; you
+  can replace one match or all of them at once, and there is an optional
+  *Match case* (otherwise ASCII case is ignored). `Esc` closes it.
 - **Live syntax colouring.** Headings, emphasis, code, quotes, lists and links
   are highlighted in place without hiding a single character of the source.
 - **Browser preview** (`Cmd/Ctrl+P`). Starts a local server, opens your
@@ -81,7 +85,9 @@ under the SIL Open Font License 1.1 (`assets/fonts/LICENSE-OFL.txt`).
 | `Cmd/Ctrl+N` | New file |
 | `Cmd/Ctrl+Q` | Quit (confirms if there is unsaved work) |
 | `Cmd/Ctrl+P` | Open the preview in your browser |
-| `Cmd/Ctrl+F` | Toggle focus mode |
+| `Cmd/Ctrl+I` | AI: explain, summarise, rephrase, proofread |
+| `Cmd/Ctrl+F` | Find and replace |
+| `Shift+Cmd/Ctrl+F` | Toggle focus mode |
 | `Cmd/Ctrl+T` | Toggle typewriter scrolling |
 | `Cmd/Ctrl+B` | Show or hide the status bar |
 | `Cmd/Ctrl+Z` / `Shift+Cmd/Ctrl+Z` | Undo / redo |
