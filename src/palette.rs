@@ -9,6 +9,29 @@ use crate::markdown::Role;
 /// An 8-bit-per-channel colour.
 pub type Rgb = (u8, u8, u8);
 
+/// Colours for syntax highlighting inside code blocks.
+///
+/// Only the preview page uses these — the editor colours a whole fenced block
+/// in one colour — but they live here so every colour in the app has a single
+/// home, and so the light theme can be chosen rather than guessed at.
+#[derive(Debug, Clone, Copy)]
+pub struct Syntax {
+    /// Comments and quotes.
+    pub comment: Rgb,
+    /// Keywords and literals.
+    pub keyword: Rgb,
+    /// String and regular-expression literals.
+    pub string: Rgb,
+    /// Numeric literals.
+    pub number: Rgb,
+    /// Function and method names.
+    pub function: Rgb,
+    /// Type and class names.
+    pub ty: Rgb,
+    /// Punctuation and operators.
+    pub punctuation: Rgb,
+}
+
 /// The editor's palette.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -40,6 +63,8 @@ pub struct Theme {
     /// Panels drawn on top of the editor.
     pub overlay_bg: Rgb,
     pub border: Rgb,
+    /// Colours for code inside the preview page.
+    pub syntax: Syntax,
 }
 
 impl Default for Theme {
@@ -67,6 +92,15 @@ impl Default for Theme {
             bar_bg: (0x11, 0x13, 0x18),
             overlay_bg: (0x1e, 0x22, 0x2a),
             border: (0x3a, 0x40, 0x4b),
+            syntax: Syntax {
+                comment: (0x5c, 0x63, 0x70),
+                keyword: (0xc6, 0x78, 0xdd),
+                string: (0x9b, 0xc8, 0x7a),
+                number: (0xd8, 0x9a, 0x60),
+                function: (0x61, 0xaf, 0xef),
+                ty: (0xe5, 0xc0, 0x7b),
+                punctuation: (0x8a, 0x92, 0xa0),
+            },
         }
     }
 }
@@ -97,6 +131,15 @@ impl Theme {
             bar_bg: (0xf0, 0xf1, 0xf3),
             overlay_bg: (0xff, 0xff, 0xff),
             border: (0xd8, 0xdc, 0xe2),
+            syntax: Syntax {
+                comment: (0x8a, 0x92, 0x9e),
+                keyword: (0x76, 0x3a, 0xa0),
+                string: (0x2c, 0x72, 0x2f),
+                number: (0x9c, 0x52, 0x12),
+                function: (0x0b, 0x6b, 0xd6),
+                ty: (0x7d, 0x61, 0x14),
+                punctuation: (0x55, 0x5d, 0x69),
+            },
         }
     }
 

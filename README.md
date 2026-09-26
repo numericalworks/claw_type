@@ -23,8 +23,9 @@ cargo run --release -- notes.md  # …opening a file
   are highlighted in place without hiding a single character of the source.
 - **Browser preview** (`Cmd/Ctrl+P`). Starts a local server, opens your
   browser, and follows the buffer as you type. It is the full reading view —
-  real headings, lists, quotes, code fences, links and images — because a
-  browser renders HTML properly. The page has its own dark/light theme.
+  real headings, lists, quotes, syntax-highlighted code, links and images —
+  because a browser renders HTML properly. The page has its own dark/light
+  theme.
 - **Native file dialogs** for open and save, and you can drag a file onto the
   window to open it. `Cmd/Ctrl+S` saves straight to the current path.
 - **A hideable status bar** (`Cmd/Ctrl+B`) showing the file, mode, word and
@@ -129,6 +130,21 @@ stays dark.
 Your choice is remembered (`localStorage`), so the page reopens the way you left
 it. Both themes are generated from the app's palette, so the preview matches the
 editor either way.
+
+### Code highlighting
+
+Fenced code blocks are highlighted by [highlight.js](https://highlightjs.org)
+11.10.0, **vendored into the binary** (`assets/highlight/`, BSD-3-Clause) and
+served from the same local server — so the preview needs no network access and
+trusts no CDN at runtime. It is the "common languages" bundle, which covers
+around 40 languages including Rust, Python, JavaScript/TypeScript, Go, C/C++,
+Java, Ruby, shell, JSON, YAML, SQL, HTML/CSS and Markdown; a fence with no
+language is auto-detected.
+
+The token colours are **not** highlight.js's own theme: they are mapped onto the
+app's palette (`Theme::syntax`), so code sits in the same palette as the rest of
+the page and works in both light and dark. Licence:
+`assets/highlight/LICENSE.txt`.
 
 ### Limitations
 

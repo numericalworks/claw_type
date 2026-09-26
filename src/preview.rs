@@ -21,6 +21,18 @@ use crate::palette::{Rgb, Theme};
 const DOC: &str = "<!--DOC-->";
 /// Where the current version goes in the page template.
 const VERSION: &str = "<!--VERSION-->";
+/// Pages must always be re-fetched; assets may be cached.
+const NO_STORE: &str = "no-store";
+
+/// highlight.js, vendored so the preview needs no network access and works
+/// offline: version 11.10.0, the "common languages" bundle.
+///
+/// BSD-3-Clause — see `assets/highlight/LICENSE.txt`.
+const HIGHLIGHT_JS: &[u8] = include_bytes!("../assets/highlight/highlight.min.js");
+
+/// Bump this whenever the vendored `highlight.min.js` is replaced: it is part of
+/// the script URL, so browsers do not keep serving a cached copy of the old one.
+const HIGHLIGHT_VERSION: &str = "11.10.0";
 
 /// The document the browser is currently showing.
 #[derive(Default)]
@@ -108,7 +120,14 @@ fn handle(stream: TcpStream, doc: &Arc<Mutex<Doc>>, shell: &str) {
             let page = shell
                 .replace(DOC, &html)
                 .replace(VERSION, &version.to_string());
-            respond(&stream, "200 OK", "text/html; charset=utf-8", None, &page);
+            respond(
+                &stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                NO_STORE,
+                None,
+                page.as_bytes(),
+            );
         }
         "/content" => {
             let (html, version) = snapshot(doc);
@@ -116,17 +135,35 @@ fn handle(stream: TcpStream, doc: &Arc<Mutex<Doc>>, shell: &str) {
                 &stream,
                 "200 OK",
                 "text/html; charset=utf-8",
+                NO_STORE,
                 Some(version),
-                &html,
+                html.as_bytes(),
             );
         }
-        "/favicon.ico" => respond(&stream, "204 No Content", "text/plain", None, ""),
+        // Cacheable: the page asks for it once, and it never changes.
+        "/highlight.js" => respond(
+            &stream,
+            "200 OK",
+            "text/javascript; charset=utf-8",
+            "max-age=86400",
+            None,
+            HIGHLIGHT_JS,
+        ),
+        "/favicon.ico" => respond(
+            &stream,
+            "204 No Content",
+            "text/plain",
+            "max-age=86400",
+            None,
+            b"",
+        ),
         _ => respond(
             &stream,
             "404 Not Found",
             "text/plain; charset=utf-8",
+            NO_STORE,
             None,
-            "not found",
+            b"not found",
         ),
     }
 }
@@ -140,8 +177,9 @@ fn respond(
     stream: &TcpStream,
     status: &str,
     content_type: &str,
+    cache: &str,
     version: Option<u64>,
-    body: &str,
+    body: &[u8],
 ) {
     let mut response = String::with_capacity(body.len() + 256);
     response.push_str("HTTP/1.1 ");
@@ -150,17 +188,19 @@ fn respond(
     response.push_str(content_type);
     response.push_str("\r\nContent-Length: ");
     response.push_str(&body.len().to_string());
-    response.push_str("\r\nCache-Control: no-store\r\nConnection: close\r\n");
+    response.push_str("\r\nCache-Control: ");
+    response.push_str(cache);
+    response.push_str("\r\nConnection: close\r\n");
     if let Some(version) = version {
         response.push_str("X-Version: ");
         response.push_str(&version.to_string());
         response.push_str("\r\n");
     }
     response.push_str("\r\n");
-    response.push_str(body);
 
     let mut writer = stream;
     let _ = writer.write_all(response.as_bytes());
+    let _ = writer.write_all(body);
     let _ = writer.flush();
 }
 
@@ -198,6 +238,7 @@ fn shell(theme: &Theme) -> String {
 <body>
 <article id="doc" data-version="{VERSION}">{DOC}</article>
 <div class="hint" id="hint" title="Toggle dark / light"></div>
+<script src="/highlight.js?v={HIGHLIGHT_VERSION}"></script>
 <script>
 {script}
 </script>
@@ -228,6 +269,13 @@ fn theme_vars(theme: &Theme) -> String {
     var(&mut out, "quote", theme.quote);
     var(&mut out, "link", theme.link);
     var(&mut out, "rule", theme.rule);
+    var(&mut out, "syn-comment", theme.syntax.comment);
+    var(&mut out, "syn-keyword", theme.syntax.keyword);
+    var(&mut out, "syn-string", theme.syntax.string);
+    var(&mut out, "syn-number", theme.syntax.number);
+    var(&mut out, "syn-function", theme.syntax.function);
+    var(&mut out, "syn-type", theme.syntax.ty);
+    var(&mut out, "syn-punctuation", theme.syntax.punctuation);
     for (level, colour) in theme.heading.iter().enumerate() {
         var(&mut out, &format!("h{}", level + 1), *colour);
     }
@@ -277,6 +325,17 @@ ul, ol { padding-left: 1.4rem; margin: 0 0 1.1em; }
 li { margin: .25em 0; }
 li > ul, li > ol { margin-bottom: 0; }
 del { opacity: .65; }
+/* highlight.js token classes, mapped onto the palette so both themes work */
+.hljs-comment, .hljs-quote { color: var(--syn-comment); font-style: italic; }
+.hljs-keyword, .hljs-literal, .hljs-selector-tag, .hljs-name, .hljs-built_in, .hljs-meta { color: var(--syn-keyword); }
+.hljs-string, .hljs-regexp, .hljs-addition, .hljs-template-variable, .hljs-attribute { color: var(--syn-string); }
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-attr, .hljs-selector-attr { color: var(--syn-number); }
+.hljs-title, .hljs-title.function_, .hljs-section, .hljs-selector-id { color: var(--syn-function); }
+.hljs-type, .hljs-class .hljs-title, .hljs-title.class_, .hljs-params, .hljs-selector-class { color: var(--syn-type); }
+.hljs-punctuation, .hljs-operator { color: var(--syn-punctuation); }
+.hljs-variable, .hljs-property, .hljs-subst { color: var(--fg); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
 .hint {
   position: fixed; right: 16px; bottom: 14px;
   font-size: 12px; padding: 5px 11px; border-radius: 999px;
@@ -310,7 +369,17 @@ function toggle() {
   apply(next);
 }
 
+function highlight() {
+  if (window.hljs) {
+    hljs.highlightAll();
+  }
+}
+
 try { apply(localStorage.getItem(KEY) || 'dark'); } catch (e) { apply('dark'); }
+
+// Code blocks arrive already escaped, so silence highlight.js's escaping warning.
+if (window.hljs) hljs.configure({ ignoreUnescapedHTML: true });
+highlight();
 
 hint.addEventListener('click', toggle);
 
@@ -330,6 +399,7 @@ async function poll() {
       version = next;
       const scroll = window.scrollY;
       doc.innerHTML = await res.text();
+      highlight();
       window.scrollTo(0, scroll);
     }
   } catch (e) {}
@@ -402,6 +472,48 @@ mod tests {
             return;
         };
         assert!(get(port, "/nope").starts_with("HTTP/1.1 404"));
+    }
+
+    #[test]
+    fn serves_the_vendored_highlighter() {
+        // The vendored file is the real thing, not a placeholder.
+        assert!(HIGHLIGHT_JS.len() > 50_000);
+        let banner = String::from_utf8_lossy(&HIGHLIGHT_JS[..200]);
+        assert!(banner.contains("Highlight.js"), "{banner}");
+
+        let Some((_preview, port)) = start() else {
+            return;
+        };
+        let response = get(port, "/highlight.js");
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(
+            response.contains("Content-Type: text/javascript"),
+            "{response}"
+        );
+        // Cacheable, unlike the pages themselves.
+        assert!(response.contains("Cache-Control: max-age=86400"), "{response}");
+        assert!(response.contains("var hljs="), "the script body must be served");
+        assert!(
+            response.contains(&format!("Content-Length: {}", HIGHLIGHT_JS.len())),
+            "the whole file must be served"
+        );
+    }
+
+    #[test]
+    fn the_page_loads_the_highlighter_and_styles_its_tokens() {
+        let page = shell(&Theme::default());
+        assert!(page.contains("<script src=\"/highlight.js?v="), "{page}");
+        // The URL is versioned so a browser cannot serve a stale cached copy.
+        assert!(
+            page.contains(&format!("?v={HIGHLIGHT_VERSION}\">")),
+            "the asset URL must carry the version"
+        );
+        assert!(page.contains("hljs.highlightAll()"));
+        // Token colours are per-theme, like everything else.
+        assert!(page.contains("--syn-keyword"));
+        assert!(page.contains(".hljs-keyword"));
+        assert!(page.contains(".hljs-string"));
+        assert!(page.contains(".hljs-comment"));
     }
 
     #[test]
