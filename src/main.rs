@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, TryRecvError};
 
 use eframe::egui;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
@@ -13,14 +14,17 @@ use egui::{
 
 use crate::markdown::{MStyle, Role};
 use crate::palette::{Rgb, Theme};
+use crate::settings::Settings;
 
 mod fonts;
 mod html;
 mod lists;
 mod markdown;
 mod math;
+mod ollama;
 mod palette;
 mod preview;
+mod settings;
 
 /// Base body text size, in points.
 const BODY_SIZE: f32 = 18.0;
@@ -88,7 +92,20 @@ const EDITOR_ID: &str = "claw_type_editor";
 enum Modal {
     None,
     Help,
+    Settings,
     ConfirmQuit,
+}
+
+/// How the last attempt to reach Ollama went.
+enum Connection {
+    /// Nothing has been tried yet.
+    NotConnected,
+    /// A request is in flight.
+    Connecting,
+    /// The server answered, and its models are in [`App::models`].
+    Connected,
+    /// The attempt failed, with something worth showing the user.
+    Failed(String),
 }
 
 struct App {
@@ -101,6 +118,14 @@ struct App {
     theme: Theme,
     status: Option<String>,
     modal: Modal,
+
+    /// How to reach Ollama, and the model to use.
+    settings: Settings,
+    /// The models the connected server offers.
+    models: Vec<String>,
+    connection: Connection,
+    /// Receives the answer from a connection attempt made off the UI thread.
+    connecting: Option<Receiver<Result<Vec<String>, String>>>,
 
     /// The browser preview, once it has been started.
     preview: Option<preview::Preview>,
@@ -135,6 +160,10 @@ impl App {
             theme,
             status: None,
             modal: Modal::None,
+            settings: Settings::load(),
+            models: Vec::new(),
+            connection: Connection::NotConnected,
+            connecting: None,
             preview: None,
             published: String::new(),
             cursor_line: 0,
@@ -286,6 +315,9 @@ impl App {
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if self.modal != Modal::None {
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+                if matches!(self.modal, Modal::Settings) {
+                    self.settings.save();
+                }
                 self.modal = Modal::None;
                 return;
             }
@@ -318,6 +350,10 @@ impl App {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::B)) {
             self.show_bar = !self.show_bar;
         }
+        // Cmd/Ctrl+, for settings, as everywhere else.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Comma)) {
+            self.modal = Modal::Settings;
+        }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
             self.request_quit(ctx);
         }
@@ -338,6 +374,7 @@ impl App {
     }
 
     fn request_quit(&mut self, ctx: &egui::Context) {
+        self.settings.save();
         if self.dirty {
             self.modal = Modal::ConfirmQuit;
         } else {
@@ -347,9 +384,13 @@ impl App {
 
     /// Intercept the window close button when there is unsaved work.
     fn guard_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.dirty {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.modal = Modal::ConfirmQuit;
+        if ctx.input(|i| i.viewport().close_requested()) {
+            // However this ends, the server settings are worth keeping.
+            self.settings.save();
+            if self.dirty {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.modal = Modal::ConfirmQuit;
+            }
         }
     }
 
@@ -408,6 +449,8 @@ impl App {
             .desired_width(width)
             .desired_rows(1)
             .hint_text("Start writing…")
+            // While a panel is open the document must not take the keystrokes.
+            .interactive(self.modal == Modal::None)
             .layouter(&mut layouter)
             .show(ui);
 
@@ -528,6 +571,7 @@ impl App {
         match self.modal {
             Modal::None => {}
             Modal::Help => self.help_window(ctx),
+            Modal::Settings => self.settings_window(ctx),
             Modal::ConfirmQuit => self.quit_window(ctx),
         }
     }
@@ -554,12 +598,13 @@ impl App {
                     .num_columns(2)
                     .spacing([18.0, 6.0])
                     .show(ui, |ui| {
-                        let rows: [(&str, &str); 13] = [
+                        let rows: [(&str, &str); 14] = [
                             ("Cmd/Ctrl+S", "Save"),
                             ("Cmd/Ctrl+O", "Open a file"),
                             ("Cmd/Ctrl+N", "New file"),
                             ("Cmd/Ctrl+Q", "Quit"),
                             ("Cmd/Ctrl+P", "Open the preview in your browser"),
+                            ("Cmd/Ctrl+,", "Settings for Ollama"),
                             ("Cmd/Ctrl+F", "Focus mode — dim other paragraphs"),
                             ("Cmd/Ctrl+T", "Typewriter scrolling"),
                             ("Cmd/Ctrl+B", "Show or hide the status bar"),
@@ -606,6 +651,190 @@ impl App {
             });
     }
 
+    // -- Ollama -------------------------------------------------------------
+
+    /// Ask the configured server which models it has, off the UI thread so the
+    /// window keeps drawing while the request is in flight.
+    ///
+    /// The settings are written when the panel is closed, not here, so that an
+    /// attempt does not touch the disk.
+    fn start_connecting(&mut self) {
+        let settings = self.settings.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.connecting = Some(receiver);
+        self.connection = Connection::Connecting;
+        std::thread::spawn(move || {
+            let _ = sender.send(ollama::list_models(&settings));
+        });
+    }
+
+    /// Collect the answer to a connection attempt, once it has arrived.
+    fn poll_connection(&mut self) {
+        let Some(receiver) = self.connecting.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(Ok(models)) => {
+                self.models = models;
+                self.connection = Connection::Connected;
+                if self.settings.has_model() && !self.models.contains(&self.settings.model) {
+                    self.status = Some(format!("{} is not on this server", self.settings.model));
+                }
+            }
+            Ok(Err(error)) => self.connection = Connection::Failed(error),
+            // Still in flight: put it back and look again next frame.
+            Err(TryRecvError::Empty) => self.connecting = Some(receiver),
+            Err(TryRecvError::Disconnected) => {
+                self.connection = Connection::Failed("the request did not finish".to_owned());
+            }
+        }
+    }
+
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let theme = self.theme;
+        egui::Window::new("Settings")
+            .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Ollama").size(12.0).color(rgb(theme.dim)));
+                ui.add_space(6.0);
+
+                egui::Grid::new("ollama_fields")
+                    .num_columns(2)
+                    .spacing([12.0, 8.0])
+                    .show(ui, |ui| {
+                        ui.label("URL");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.url)
+                                .desired_width(330.0)
+                                .hint_text(settings::DEFAULT_URL),
+                        );
+                        ui.end_row();
+
+                        ui.label("API key");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.settings.api_key)
+                                .desired_width(330.0)
+                                .password(true)
+                                .hint_text("none"),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Leave the key empty for a local server; a hosted one needs a bearer token.",
+                    )
+                    .size(11.0)
+                    .color(rgb(theme.dim)),
+                );
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    let connecting = matches!(self.connection, Connection::Connecting);
+                    if ui
+                        .add_enabled(!connecting, egui::Button::new("Connect"))
+                        .clicked()
+                    {
+                        self.start_connecting();
+                    }
+                    ui.add_space(10.0);
+
+                    let (message, colour) = match &self.connection {
+                        Connection::NotConnected => ("Not connected".to_owned(), theme.dim),
+                        Connection::Connecting => ("Connecting…".to_owned(), theme.dim),
+                        Connection::Connected => (
+                            format!("Connected — {} model(s)", self.models.len()),
+                            theme.list,
+                        ),
+                        Connection::Failed(error) => (error.clone(), theme.heading[0]),
+                    };
+                    ui.label(egui::RichText::new(message).size(12.0).color(rgb(colour)));
+                });
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Model").size(12.0).color(rgb(theme.dim)));
+                ui.add_space(4.0);
+
+                if self.models.is_empty() {
+                    // Nothing fetched yet: name the model that is already
+                    // chosen, so it is clear the choice survived the last run
+                    // without having to connect again to see it.
+                    match &self.connection {
+                        Connection::Connected => {
+                            ui.label(
+                                egui::RichText::new("This server has no models.")
+                                    .size(12.0)
+                                    .color(rgb(theme.dim)),
+                            );
+                        }
+                        Connection::Connecting => {
+                            ui.label(
+                                egui::RichText::new("Asking the server…")
+                                    .size(12.0)
+                                    .color(rgb(theme.dim)),
+                            );
+                        }
+                        _ if self.settings.has_model() => {
+                            ui.label(egui::RichText::new(&self.settings.model).color(rgb(theme.fg)));
+                            ui.label(
+                                egui::RichText::new("(press Connect to change it)")
+                                    .size(11.0)
+                                    .color(rgb(theme.dim)),
+                            );
+                        }
+                        _ => {
+                            ui.label(
+                                egui::RichText::new("Connect to choose a model.")
+                                    .size(12.0)
+                                    .color(rgb(theme.dim)),
+                            );
+                        }
+                    }
+                } else {
+                    let models = self.models.clone();
+                    egui::ScrollArea::vertical()
+                        .id_salt("models")
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            for model in models {
+                                let selected = self.settings.model == model;
+                                if ui.selectable_label(selected, model.as_str()).clicked() {
+                                    self.settings.model = model;
+                                    self.settings.save();
+                                }
+                            }
+                        });
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Done").clicked() {
+                        self.settings.save();
+                        self.modal = Modal::None;
+                    }
+                    ui.add_space(10.0);
+                    if let Some(path) = settings::config_path() {
+                        ui.label(
+                            egui::RichText::new(format!("saved to {}", path.display()))
+                                .size(10.0)
+                                .color(rgb(theme.dim)),
+                        );
+                    }
+                });
+
+                // Look for the answer while a request is in flight.
+                if matches!(self.connection, Connection::Connecting) {
+                    ui.ctx().request_repaint();
+                }
+            });
+    }
+
     /// Draw the whole interface into `ui`.
     ///
     /// Split out from the [`eframe::App`] implementation so it can be driven
@@ -632,6 +861,7 @@ impl App {
             .show(ui, |ui| self.body(ui));
 
         self.modals(ui.ctx());
+        self.poll_connection();
     }
 }
 
@@ -1306,6 +1536,110 @@ mod tests {
         frame(&ctx, &mut app, Vec::new());
         assert!(app.preview.is_none());
         assert!(app.published.is_empty());
+    }
+
+    /// The text egui drew this frame, so a test can see the interface.
+    fn frame_text(ctx: &egui::Context, app: &mut App, events: Vec<egui::Event>) -> String {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ui| app.draw(ui),
+        );
+        output.textures_delta.clear();
+        let mut text = String::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut text);
+        }
+        text
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut String) {
+        match shape {
+            egui::Shape::Text(text) => {
+                out.push_str(text.galley.text());
+                out.push('\n');
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The settings panel opens on the shortcut, shows what it needs to, lists
+    /// the models once connected, and keeps the document out of the way.
+    #[test]
+    fn the_settings_panel_lists_the_models() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "hello".to_owned();
+
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, key(Key::Comma, Modifiers::COMMAND));
+        assert!(app.modal == Modal::Settings, "Cmd+, should open settings");
+
+        let text = frame_text(&ctx, &mut app, Vec::new());
+        for expected in ["Settings", "Ollama", "URL", "API key", "Connect"] {
+            assert!(text.contains(expected), "missing {expected} in:\n{text}");
+        }
+
+        // While the panel is up, the document must not take the keystrokes.
+        frame(&ctx, &mut app, text_event("x"));
+        assert_eq!(app.text, "hello", "settings should not edit the document");
+
+        // Once connected the models are listed and one is selected.
+        app.connection = Connection::Connected;
+        app.models = vec!["llama3.2:latest".to_owned(), "qwen2.5-coder:7b".to_owned()];
+        app.settings.model = "qwen2.5-coder:7b".to_owned();
+        let text = frame_text(&ctx, &mut app, Vec::new());
+        for expected in ["Connected", "llama3.2:latest", "qwen2.5-coder:7b"] {
+            assert!(text.contains(expected), "missing {expected} in:\n{text}");
+        }
+    }
+
+    /// A model chosen on an earlier run is shown before reconnecting.
+    #[test]
+    fn a_saved_model_is_shown_without_reconnecting() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.modal = Modal::Settings;
+        app.settings.model = "llama3.2:latest".to_owned();
+        assert!(app.models.is_empty(), "nothing has been fetched");
+
+        // A window needs one pass to size itself before it draws its contents.
+        frame(&ctx, &mut app, Vec::new());
+        let text = frame_text(&ctx, &mut app, Vec::new());
+        assert!(text.contains("llama3.2:latest"), "{text}");
+        assert!(text.contains("press Connect"), "{text}");
+    }
+
+    /// A failed connection is reported rather than hanging or panicking.
+    #[test]
+    fn a_failed_connection_is_reported() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        // Nothing listens on port 1, so this refuses immediately.
+        app.settings.url = "http://127.0.0.1:1".to_owned();
+
+        app.start_connecting();
+        assert!(matches!(app.connection, Connection::Connecting));
+
+        for _ in 0..200 {
+            app.poll_connection();
+            if !matches!(app.connection, Connection::Connecting) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        match &app.connection {
+            Connection::Failed(error) => assert!(!error.is_empty()),
+            _ => panic!("expected a failure to be reported"),
+        }
     }
 
     /// `TextEdit` with its custom layouter, the fonts and the panels.

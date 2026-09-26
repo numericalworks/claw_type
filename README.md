@@ -29,6 +29,8 @@ cargo run --release -- notes.md  # …opening a file
 - **AsciiMath in the preview** (`Cmd/Ctrl+P`). `$inline$` and `$$display$$`
   maths is converted to MathML and drawn by the browser itself, in both themes —
   see [*Maths*](#maths).
+- **Ollama settings** (`Cmd/Ctrl+,`). Point the app at a local or hosted
+  Ollama, connect, and pick the model to use — see [*Ollama*](#ollama).
 - **Native file dialogs** for open and save, and you can drag a file onto the
   window to open it. `Cmd/Ctrl+S` saves straight to the current path.
 - **A hideable status bar** (`Cmd/Ctrl+B`) showing the file, mode, word and
@@ -84,6 +86,7 @@ under the SIL Open Font License 1.1 (`assets/fonts/LICENSE-OFL.txt`).
 | `Cmd/Ctrl+B` | Show or hide the status bar |
 | `Cmd/Ctrl+Z` / `Shift+Cmd/Ctrl+Z` | Undo / redo |
 | `Cmd/Ctrl+H` or `F1` | Shortcut help |
+| `Cmd/Ctrl+,` | Settings for Ollama |
 | `Esc` | Close a panel |
 
 In the preview page, press `d` to switch between dark and light (see
@@ -100,6 +103,8 @@ The crate is a single binary with small, focused modules:
 | `src/html.rs` | Turns the same parse into HTML for the preview |
 | `src/math.rs` | Converts AsciiMath into MathML |
 | `src/preview.rs` | The local preview server, page template and theme toggle |
+| `src/settings.rs` | Where Ollama is, and which model to use |
+| `src/ollama.rs` | Asking an Ollama server what models it has |
 | `src/palette.rs` | The colour palette, stored as plain RGB |
 | `src/lists.rs` | Bullet / numbered / quote continuation on Enter |
 | `src/fonts.rs` | Bundled Noto Sans, plus lazy loading of a system CJK font |
@@ -221,6 +226,39 @@ covers what is listed above; matrices such as `((a,b),(c,d))` and the font
 commands (`bb`, `cc`, `fr`, …) are not supported and come out as plain text.
 Unknown input is never an error — it just renders as ordinary letters.
 
+## Ollama
+
+`Cmd/Ctrl+,` opens **Settings**, where the app is pointed at an
+[Ollama](https://ollama.com) server and a model is chosen for the AI features.
+
+| Field | Meaning |
+| --- | --- |
+| URL | Where the server is. Defaults to `http://localhost:11434`, the address a local Ollama listens on. A missing scheme is filled in, so `localhost:11434` works as it is. |
+| API key | Only for a hosted server, sent as `Authorization: Bearer …`. Leave it empty for a local one. |
+
+**Connect** asks the server for its models (`/api/tags`) and lists them underneath;
+click one to choose it. The request runs on a background thread, so the window
+keeps drawing while it is in flight, and a wrong address or a bad key is
+reported in the panel rather than hanging.
+
+The URL, the API key and the chosen model are **kept between runs** — there is no
+Save button to remember. They are written when you close the panel (`Done` or
+`Esc`), when you click a model, and when you quit, and read back at startup. The
+panel also names the chosen model before you connect, so you can see it is still
+there. To change server, type a new URL and press Connect again.
+
+What you enter is written to a small file, so it survives a restart:
+
+| Platform | Location |
+| --- | --- |
+| macOS | `~/Library/Application Support/claw_type/settings.conf` |
+| Linux | `$XDG_CONFIG_HOME/claw_type/settings.conf`, or `~/.config/…` |
+| Windows | `%APPDATA%\claw_type\settings.conf` |
+
+Set `CLAW_TYPE_CONFIG` to put it somewhere else. On Unix the file is created
+readable only by its owner, but note that the API key is stored in plain text —
+treat it as you would any credential on disk.
+
 ## Tests
 
 ```sh
@@ -234,4 +272,5 @@ itself — including headless frames driven through an `egui::Context` (that the
 highlighted layout is byte-for-byte identical to the source, so the caret never
 drifts, and that pressing Enter continues a list while ordinary typing does
 not). The preview server is tested by starting it on a loopback port and making
-real HTTP requests against it.
+real HTTP requests against it, and the Ollama client by pointing it at a
+throwaway server that answers with a canned reply.
