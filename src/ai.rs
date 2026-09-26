@@ -26,6 +26,7 @@ pub enum Action {
     RephraseParagraph,
     ProofreadParagraph,
     ProofreadDocument,
+    Summarize,
 }
 
 /// Which part of the document an action works on.
@@ -43,7 +44,7 @@ pub enum Target {
 
 impl Action {
     /// Every action, in the order the panel lists them.
-    pub const ALL: [Action; 7] = [
+    pub const ALL: [Action; 8] = [
         Action::Meaning,
         Action::Synonyms,
         Action::Antonyms,
@@ -51,6 +52,7 @@ impl Action {
         Action::RephraseParagraph,
         Action::ProofreadParagraph,
         Action::ProofreadDocument,
+        Action::Summarize,
     ];
 
     pub fn label(self) -> &'static str {
@@ -62,6 +64,7 @@ impl Action {
             Action::RephraseParagraph => "Rephrase the paragraph",
             Action::ProofreadParagraph => "Proofread and correct the paragraph",
             Action::ProofreadDocument => "Proofread and correct the whole document",
+            Action::Summarize => "Summarise the document",
         }
     }
 
@@ -70,21 +73,25 @@ impl Action {
             Action::Meaning | Action::Synonyms | Action::Antonyms => Target::Word,
             Action::RephraseSentence => Target::Sentence,
             Action::RephraseParagraph | Action::ProofreadParagraph => Target::Paragraph,
-            Action::ProofreadDocument => Target::Document,
+            Action::ProofreadDocument | Action::Summarize => Target::Document,
         }
     }
 
     /// Whether the answer is meant to take the place of the text it came from.
     ///
-    /// Explaining a word is not something to paste over it.
+    /// Explaining a word, or summarising a document, is not something to paste
+    /// over the text.
     pub fn replaces(self) -> bool {
-        !matches!(self, Action::Meaning | Action::Synonyms | Action::Antonyms)
+        !matches!(
+            self,
+            Action::Meaning | Action::Synonyms | Action::Antonyms | Action::Summarize
+        )
     }
 
     /// Lower is steadier; corrections want as little invention as possible.
     fn temperature(self) -> f32 {
         match self {
-            Action::Meaning | Action::Synonyms | Action::Antonyms => 0.4,
+            Action::Meaning | Action::Synonyms | Action::Antonyms | Action::Summarize => 0.4,
             _ => 0.2,
         }
     }
@@ -138,6 +145,13 @@ impl Action {
                     .to_owned(),
                 format!(
                     "Correct the spelling, grammar and punctuation of this Markdown document. Keep the wording, the meaning and the Markdown structure as they are, and change only what is wrong. Reply with the whole corrected document, without a code fence wrapping it and without any comment.\n\n{subject}"
+                ),
+            ),
+            Action::Summarize => (
+                "You summarise documents faithfully and concisely. Reply with nothing but the summary."
+                    .to_owned(),
+                format!(
+                    "Summarise this Markdown document in a short paragraph, or in a few bullet points if that is clearer. Keep it faithful to the document and add nothing that is not in it. Reply with only the summary, without a code fence and without any comment.\n\n{subject}"
                 ),
             ),
         }
@@ -487,6 +501,10 @@ mod tests {
         let (_, user) = Action::Synonyms.prompt("happy", "She was happy.");
         assert!(user.contains("happy"), "{user}");
         assert!(user.contains("She was happy."), "{user}");
+
+        let (_, user) = Action::Summarize.prompt("A whole document.", "");
+        assert!(user.contains("A whole document."), "{user}");
+        assert!(user.contains("summar"), "{user}");
     }
 
     #[test]
@@ -494,6 +512,7 @@ mod tests {
         assert!(!Action::Meaning.replaces());
         assert!(!Action::Synonyms.replaces());
         assert!(!Action::Antonyms.replaces());
+        assert!(!Action::Summarize.replaces());
         for action in [
             Action::RephraseSentence,
             Action::RephraseParagraph,

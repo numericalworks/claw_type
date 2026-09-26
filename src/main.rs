@@ -89,7 +89,7 @@ fn parse_args() -> Option<PathBuf> {
     None
 }
 
-/// The number key for the `index`-th AI action, for `1`..`7`.
+/// The number key for the `index`-th AI action, for `1`..`8`.
 fn digit_key(index: usize) -> Option<Key> {
     Some(match index {
         0 => Key::Num1,
@@ -99,6 +99,7 @@ fn digit_key(index: usize) -> Option<Key> {
         4 => Key::Num5,
         5 => Key::Num6,
         6 => Key::Num7,
+        7 => Key::Num8,
         _ => return None,
     })
 }
@@ -714,7 +715,7 @@ impl App {
                             ("Cmd/Ctrl+Q", "Quit"),
                             ("Cmd/Ctrl+P", "Open the preview in your browser"),
                             ("Cmd/Ctrl+,", "Settings for Ollama"),
-                            ("Cmd/Ctrl+I", "AI: explain, rephrase, proofread"),
+                            ("Cmd/Ctrl+I", "AI: explain, summarise, rephrase, proofread"),
                             ("Cmd/Ctrl+F", "Focus mode — dim other paragraphs"),
                             ("Cmd/Ctrl+T", "Typewriter scrolling"),
                             ("Cmd/Ctrl+B", "Show or hide the status bar"),
@@ -2124,6 +2125,15 @@ mod tests {
 
         frame(&ctx, &mut app, key(Key::Escape, Modifiers::NONE));
         assert!(app.modal == Modal::None, "Esc should close the AI panel");
+    }
+
+    /// Every action in the panel has a number key, and there is no extra key.
+    #[test]
+    fn every_ai_action_has_a_digit_key() {
+        for index in 0..AiAction::ALL.len() {
+            assert!(digit_key(index).is_some(), "action {index} has no key");
+        }
+        assert!(digit_key(AiAction::ALL.len()).is_none());
     }
 
     /// Each action picks the text the caret is in, and a word action sends the
