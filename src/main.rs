@@ -4,18 +4,22 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
 use eframe::egui;
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
+use egui::widgets::text_edit::TextEditState;
 use egui::{
     Align, Align2, Color32, FontId, Frame, Id, Key, Margin, Modifiers, Stroke, Vec2,
 };
 
+use crate::ai::Action as AiAction;
 use crate::markdown::{MStyle, Role};
 use crate::palette::{Rgb, Theme};
 use crate::settings::Settings;
 
+mod ai;
 mod fonts;
 mod html;
 mod lists;
@@ -85,6 +89,20 @@ fn parse_args() -> Option<PathBuf> {
     None
 }
 
+/// The number key for the `index`-th AI action, for `1`..`7`.
+fn digit_key(index: usize) -> Option<Key> {
+    Some(match index {
+        0 => Key::Num1,
+        1 => Key::Num2,
+        2 => Key::Num3,
+        3 => Key::Num4,
+        4 => Key::Num5,
+        5 => Key::Num6,
+        6 => Key::Num7,
+        _ => return None,
+    })
+}
+
 /// The `Id` of the main text editor, used to read and write its caret.
 const EDITOR_ID: &str = "claw_type_editor";
 
@@ -93,7 +111,47 @@ enum Modal {
     None,
     Help,
     Settings,
+    Ai,
     ConfirmQuit,
+}
+
+/// How an AI request is going.
+#[derive(Clone, PartialEq, Eq, Default)]
+enum AiStatus {
+    #[default]
+    Idle,
+    Running,
+    Done,
+    Failed(String),
+}
+
+/// The AI panel: the action being run, and the answer as it arrives.
+#[derive(Default)]
+struct Ai {
+    /// What the model has said so far.
+    answer: String,
+    status: AiStatus,
+    /// The action, and the range of the document it applies to.
+    request: Option<(AiAction, (usize, usize))>,
+    /// Where the answer is arriving from.
+    events: Option<Receiver<ai::Event>>,
+    /// Set to stop a generation part way.
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+impl Ai {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn running(&self) -> bool {
+        matches!(self.status, AiStatus::Running)
+    }
+
+    /// Whether there is something to show in place of the editor.
+    fn showing(&self) -> bool {
+        self.request.is_some() || !self.answer.is_empty() || !matches!(self.status, AiStatus::Idle)
+    }
 }
 
 /// How the last attempt to reach Ollama went.
@@ -126,6 +184,11 @@ struct App {
     connection: Connection,
     /// Receives the answer from a connection attempt made off the UI thread.
     connecting: Option<Receiver<Result<Vec<String>, String>>>,
+
+    /// The AI panel.
+    ai: Ai,
+    /// The current selection, if any, in character offsets.
+    selection: Option<(usize, usize)>,
 
     /// The browser preview, once it has been started.
     preview: Option<preview::Preview>,
@@ -164,6 +227,8 @@ impl App {
             models: Vec::new(),
             connection: Connection::NotConnected,
             connecting: None,
+            ai: Ai::default(),
+            selection: None,
             preview: None,
             published: String::new(),
             cursor_line: 0,
@@ -314,6 +379,26 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
         if self.modal != Modal::None {
+            // The AI panel takes a digit per action, and closes on Esc or
+            // Cmd/Ctrl+I.
+            if self.modal == Modal::Ai {
+                if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape))
+                    || ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::I))
+                {
+                    self.close_ai();
+                    return;
+                }
+                for (index, action) in AiAction::ALL.iter().enumerate() {
+                    if let Some(key) = digit_key(index)
+                        && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, key))
+                    {
+                        self.start_ai(*action);
+                        return;
+                    }
+                }
+                return;
+            }
+
             if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 if matches!(self.modal, Modal::Settings) {
                     self.settings.save();
@@ -353,6 +438,10 @@ impl App {
         // Cmd/Ctrl+, for settings, as everywhere else.
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Comma)) {
             self.modal = Modal::Settings;
+        }
+        // Cmd/Ctrl+I for the AI panel.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::I)) {
+            self.toggle_ai();
         }
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Q)) {
             self.request_quit(ctx);
@@ -410,7 +499,13 @@ impl App {
                     ui.add_space(pad);
                     ui.vertical(|ui| {
                         ui.set_width(width);
-                        self.editor(ui, width);
+                        if self.ai.showing() {
+                            // The answer takes the editor's place, so it can be
+                            // read and then copied or put in its place.
+                            self.ai_panel(ui, width);
+                        } else {
+                            self.editor(ui, width);
+                        }
                     });
                 });
                 ui.add_space(TOP_PAD);
@@ -501,6 +596,20 @@ impl App {
             self.focus_para = paragraph_bounds(&self.text, line);
         }
 
+        // Remember the last known caret and selection: while a panel is open the
+        // editor is not interactive and reports neither, and the AI actions
+        // still need to know what the caret was on.
+        if let Some(range) = output.cursor_range.as_ref() {
+            let (a, b) = (range.primary.index.0, range.secondary.index.0);
+            self.selection = (a != b).then_some((a.min(b), a.max(b)));
+        }
+        // `cursor` is the caret after this frame's edit. When a list marker was
+        // just added it sits past the marker, which the editor's own cursor
+        // range does not yet reflect, so trust it over `output.cursor_range`.
+        if let Some(index) = cursor {
+            self.prev_cursor = Some(index);
+        }
+
         if response.changed() {
             self.dirty = true;
             self.status = None;
@@ -508,8 +617,7 @@ impl App {
 
         // Typewriter scrolling: keep the caret vertically centred, but only
         // when it actually moves, so the user can still scroll while idle.
-        let moved = cursor != self.prev_cursor;
-        self.prev_cursor = cursor;
+        let moved = cursor.is_some() && cursor != self.prev_cursor;
         if self.typewriter
             && moved
             && response.has_focus()
@@ -572,6 +680,7 @@ impl App {
             Modal::None => {}
             Modal::Help => self.help_window(ctx),
             Modal::Settings => self.settings_window(ctx),
+            Modal::Ai => self.ai_window(ctx),
             Modal::ConfirmQuit => self.quit_window(ctx),
         }
     }
@@ -598,13 +707,14 @@ impl App {
                     .num_columns(2)
                     .spacing([18.0, 6.0])
                     .show(ui, |ui| {
-                        let rows: [(&str, &str); 14] = [
+                        let rows: [(&str, &str); 15] = [
                             ("Cmd/Ctrl+S", "Save"),
                             ("Cmd/Ctrl+O", "Open a file"),
                             ("Cmd/Ctrl+N", "New file"),
                             ("Cmd/Ctrl+Q", "Quit"),
                             ("Cmd/Ctrl+P", "Open the preview in your browser"),
                             ("Cmd/Ctrl+,", "Settings for Ollama"),
+                            ("Cmd/Ctrl+I", "AI: explain, rephrase, proofread"),
                             ("Cmd/Ctrl+F", "Focus mode — dim other paragraphs"),
                             ("Cmd/Ctrl+T", "Typewriter scrolling"),
                             ("Cmd/Ctrl+B", "Show or hide the status bar"),
@@ -835,6 +945,326 @@ impl App {
             });
     }
 
+    // -- AI -----------------------------------------------------------------
+
+    /// Open the AI panel, or close it if it is already open.
+    fn toggle_ai(&mut self) {
+        if self.modal == Modal::Ai {
+            self.close_ai();
+        } else {
+            self.ai.clear();
+            self.modal = Modal::Ai;
+        }
+    }
+
+    fn close_ai(&mut self) {
+        // Stop anything still being written; the answer so far is dropped.
+        if let Some(cancel) = &self.ai.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        self.ai.clear();
+        self.modal = Modal::None;
+    }
+
+    /// The text an action applies to: the subject, the sentence around it for a
+    /// word, and the range of the document it occupies.
+    fn ai_subject(&self, action: AiAction) -> Option<(String, String, (usize, usize))> {
+        let chars: Vec<char> = self.text.chars().collect();
+        let caret = self.prev_cursor.unwrap_or(0).min(chars.len());
+
+        let range = match action.target() {
+            ai::Target::Document => (0, chars.len()),
+            ai::Target::Word => self
+                .selection
+                .or_else(|| ai::word_at(&self.text, caret))?,
+            ai::Target::Sentence => self
+                .selection
+                .unwrap_or_else(|| ai::sentence_at(&self.text, caret)),
+            ai::Target::Paragraph => match self.selection {
+                Some(range) => range,
+                None => {
+                    let (first, last) = paragraph_bounds(&self.text, self.cursor_line);
+                    (ai::line_range(&self.text, first).0, ai::line_range(&self.text, last).1)
+                }
+            },
+        };
+
+        let start = range.0.min(chars.len());
+        let end = range.1.clamp(start, chars.len());
+        let subject: String = chars[start..end].iter().collect();
+        if subject.trim().is_empty() {
+            return None;
+        }
+
+        // A word means little on its own, so its sentence goes along as context.
+        let context = if action.target() == ai::Target::Word {
+            let (start, end) = ai::sentence_at(&self.text, caret);
+            chars[start..end].iter().collect()
+        } else {
+            String::new()
+        };
+
+        Some((subject.trim().to_owned(), context, range))
+    }
+
+    /// Ask the model for the chosen action.
+    fn start_ai(&mut self, action: AiAction) {
+        if !self.settings.has_model() {
+            self.ai.answer.clear();
+            self.ai.request = Some((action, (0, 0)));
+            self.ai.status =
+                AiStatus::Failed("Choose a model in Settings first (Cmd/Ctrl+,)".to_owned());
+            return;
+        }
+
+        let Some((subject, context, range)) = self.ai_subject(action) else {
+            self.ai.answer.clear();
+            self.ai.request = Some((action, (0, 0)));
+            self.ai.status = AiStatus::Failed(match action.target() {
+                ai::Target::Word => "Put the caret on a word first".to_owned(),
+                _ => "There is nothing here to work on".to_owned(),
+            });
+            return;
+        };
+
+        self.ai.answer.clear();
+        self.ai.status = AiStatus::Running;
+        self.ai.request = Some((action, range));
+
+        let settings = self.settings.clone();
+        let (sender, events) = std::sync::mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.ai.events = Some(events);
+        self.ai.cancel = Some(Arc::clone(&cancel));
+        std::thread::spawn(move || {
+            ai::run(&settings, action, &subject, &context, &sender, &cancel);
+        });
+    }
+
+    /// Collect whatever the model has sent since the last frame.
+    fn poll_ai(&mut self) {
+        let Some(events) = self.ai.events.take() else {
+            return;
+        };
+        let mut finished = false;
+        loop {
+            match events.try_recv() {
+                Ok(ai::Event::Chunk(chunk)) => self.ai.answer.push_str(&chunk),
+                Ok(ai::Event::Done) => {
+                    self.ai.status = AiStatus::Done;
+                    finished = true;
+                    break;
+                }
+                Ok(ai::Event::Failed(error)) => {
+                    self.ai.status = AiStatus::Failed(error);
+                    finished = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                // The thread ended without saying so; what we have is all there
+                // is going to be.
+                Err(TryRecvError::Disconnected) => {
+                    if self.ai.running() {
+                        self.ai.status = AiStatus::Done;
+                    }
+                    finished = true;
+                    break;
+                }
+            }
+        }
+        if finished {
+            self.ai.cancel = None;
+        } else {
+            self.ai.events = Some(events);
+        }
+    }
+
+    /// Put the answer in place of the text it was made from.
+    fn replace_with_answer(&mut self, ctx: &egui::Context) {
+        let Some((action, range)) = self.ai.request else {
+            return;
+        };
+        let answer = ai::clean(&self.ai.answer);
+        if !action.replaces() || answer.is_empty() {
+            return;
+        }
+
+        self.text = ai::splice(&self.text, range, &answer);
+        self.dirty = true;
+
+        // Put the caret just after the new text and give the editor focus back.
+        let caret = range.0 + answer.chars().count();
+        let mut state = TextEditState::load(ctx, Id::new(EDITOR_ID)).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+        state.store(ctx, Id::new(EDITOR_ID));
+        self.prev_cursor = Some(caret);
+        self.focus_requested = true;
+
+        self.status = Some("Replaced with the model's text — Cmd/Ctrl+Z undoes it".to_owned());
+        self.close_ai();
+    }
+
+    /// The panel of actions, shown near the bottom of the window.
+    fn ai_window(&mut self, ctx: &egui::Context) {
+        let theme = self.theme;
+        let model = if self.settings.has_model() {
+            self.settings.model.clone()
+        } else {
+            "no model chosen".to_owned()
+        };
+        let enabled = self.settings.has_model() && !self.ai.running();
+        let running = self.ai.running();
+        let cancel = self.ai.cancel.clone();
+
+        egui::Window::new("AI")
+            .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -28.0))
+            .collapsible(false)
+            .resizable(false)
+            .default_width(540.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("Ollama — {model}"))
+                        .size(11.0)
+                        .color(rgb(theme.dim)),
+                );
+                ui.add_space(6.0);
+
+                for (index, action) in AiAction::ALL.iter().enumerate() {
+                    let target = match action.target() {
+                        ai::Target::Word => "the word at the caret",
+                        ai::Target::Sentence => "the sentence at the caret",
+                        ai::Target::Paragraph => "the paragraph at the caret",
+                        ai::Target::Document => "the whole document",
+                    };
+                    let label = format!("{}.  {} — {target}", index + 1, action.label());
+                    let button = egui::Button::new(label).min_size(Vec2::new(505.0, 0.0));
+                    if ui.add_enabled(enabled, button).clicked() {
+                        self.start_ai(*action);
+                    }
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    match &self.ai.status {
+                        AiStatus::Idle => {
+                            let hint = if self.settings.has_model() {
+                                "Pick one. The answer appears in the editor, ready to copy or to replace your text."
+                            } else {
+                                "Choose a model in Settings first."
+                            };
+                            ui.label(egui::RichText::new(hint).size(11.0).color(rgb(theme.dim)));
+                        }
+                        AiStatus::Running => {
+                            ui.label(
+                                egui::RichText::new("Asking the model…")
+                                    .size(11.0)
+                                    .color(rgb(theme.dim)),
+                            );
+                            if ui.button("Stop").clicked()
+                                && let Some(cancel) = &cancel
+                            {
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                        }
+                        AiStatus::Done => {
+                            ui.label(
+                                egui::RichText::new("Done — copy it, or replace your text.")
+                                    .size(11.0)
+                                    .color(rgb(theme.dim)),
+                            );
+                        }
+                        AiStatus::Failed(error) => {
+                            ui.label(egui::RichText::new(error).size(11.0).color(rgb(theme.heading[0])));
+                        }
+                    }
+                });
+
+                // Look for the answer while a request is in flight.
+                if running {
+                    ui.ctx().request_repaint();
+                }
+            });
+    }
+
+    /// The answer, shown in the editor's place so it can be read, copied, or
+    /// put in place of the text it came from.
+    fn ai_panel(&mut self, ui: &mut egui::Ui, width: f32) {
+        let theme = self.theme;
+        let label = self
+            .ai
+            .request
+            .map(|(action, _)| action.label())
+            .unwrap_or("AI");
+        let model = self.settings.model.clone();
+        let answer = ai::clean(&self.ai.answer);
+        let replaces = self.ai.request.is_some_and(|(action, _)| action.replaces());
+        let has_answer = !answer.is_empty();
+        let running = self.ai.running();
+
+        ui.set_width(width);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(label).color(rgb(theme.fg)).strong());
+            ui.label(
+                egui::RichText::new(format!("— {model}"))
+                    .size(11.0)
+                    .color(rgb(theme.dim)),
+            );
+        });
+        ui.add_space(8.0);
+
+        // The buttons sit above the answer, so they stay reachable however long
+        // it turns out to be.
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(has_answer, egui::Button::new("Copy"))
+                .clicked()
+            {
+                ui.ctx().copy_text(answer.clone());
+                self.status = Some("Copied the answer".to_owned());
+            }
+            if ui
+                .add_enabled(has_answer && replaces, egui::Button::new("Replace my text"))
+                .clicked()
+            {
+                self.replace_with_answer(ui.ctx());
+                return;
+            }
+            if ui
+                .add_enabled(!running && self.ai.request.is_some(), egui::Button::new("Retry"))
+                .clicked()
+                && let Some((action, _)) = self.ai.request
+            {
+                self.start_ai(action);
+            }
+            if ui.button("Discard").clicked() {
+                self.close_ai();
+                return;
+            }
+            if running {
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new("writing…")
+                        .size(11.0)
+                        .color(rgb(theme.dim)),
+                );
+            }
+        });
+
+        ui.add_space(12.0);
+
+        match &self.ai.status {
+            AiStatus::Failed(error) => {
+                ui.label(egui::RichText::new(error).color(rgb(theme.heading[0])));
+            }
+            _ => {
+                ui.label(egui::RichText::new(answer).color(rgb(theme.fg)));
+            }
+        }
+    }
+
     /// Draw the whole interface into `ui`.
     ///
     /// Split out from the [`eframe::App`] implementation so it can be driven
@@ -862,6 +1292,7 @@ impl App {
 
         self.modals(ui.ctx());
         self.poll_connection();
+        self.poll_ai();
     }
 }
 
@@ -1680,5 +2111,49 @@ mod tests {
             frame(&ctx, &mut app, events);
             assert!(app.modal == Modal::None, "{label} should close help");
         }
+    }
+
+    /// Cmd/Ctrl+I opens the AI panel, and Esc closes it again.
+    #[test]
+    fn cmd_i_toggles_the_ai_panel() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+
+        frame(&ctx, &mut app, key(Key::I, Modifiers::COMMAND));
+        assert!(app.modal == Modal::Ai, "Cmd+I should open the AI panel");
+
+        frame(&ctx, &mut app, key(Key::Escape, Modifiers::NONE));
+        assert!(app.modal == Modal::None, "Esc should close the AI panel");
+    }
+
+    /// Each action picks the text the caret is in, and a word action sends the
+    /// sentence around it along as context.
+    #[test]
+    fn ai_actions_work_on_what_the_caret_is_in() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "First one. Second word here.".to_owned();
+        focus_editor_at(&ctx, 14); // inside "Second"
+        frame(&ctx, &mut app, Vec::new());
+
+        let (subject, context, range) = app.ai_subject(AiAction::Meaning).expect("a word");
+        assert_eq!(subject, "Second");
+        assert_eq!(range, (11, 17));
+        assert_eq!(context, "Second word here.");
+
+        let (subject, _, _) = app
+            .ai_subject(AiAction::RephraseSentence)
+            .expect("a sentence");
+        assert_eq!(subject, "Second word here.");
+
+        let (subject, _, _) = app
+            .ai_subject(AiAction::ProofreadParagraph)
+            .expect("a paragraph");
+        assert_eq!(subject, "First one. Second word here.");
+
+        let (_, _, range) = app
+            .ai_subject(AiAction::ProofreadDocument)
+            .expect("a document");
+        assert_eq!(range, (0, app.text.chars().count()));
     }
 }

@@ -62,7 +62,7 @@ fn models_from_json(body: &str) -> Result<Vec<String>, String> {
 }
 
 /// A message worth showing to someone who typed an address.
-fn describe(error: &ureq::Error) -> String {
+pub(crate) fn describe(error: &ureq::Error) -> String {
     match error {
         ureq::Error::StatusCode(code) => match code {
             401 | 403 => "the server rejected the API key".to_owned(),
