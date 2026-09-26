@@ -26,6 +26,9 @@ cargo run --release -- notes.md  # …opening a file
   real headings, lists, quotes, syntax-highlighted code, links and images —
   because a browser renders HTML properly. The page has its own dark/light
   theme.
+- **AsciiMath in the preview** (`Cmd/Ctrl+P`). `$inline$` and `$$display$$`
+  maths is converted to MathML and drawn by the browser itself, in both themes —
+  see [*Maths*](#maths).
 - **Native file dialogs** for open and save, and you can drag a file onto the
   window to open it. `Cmd/Ctrl+S` saves straight to the current path.
 - **A hideable status bar** (`Cmd/Ctrl+B`) showing the file, mode, word and
@@ -95,6 +98,7 @@ The crate is a single binary with small, focused modules:
 | `src/main.rs` | The window: layout jobs, shortcuts, panels, file dialogs |
 | `src/markdown.rs` | Parses Markdown into *semantically tagged* characters |
 | `src/html.rs` | Turns the same parse into HTML for the preview |
+| `src/math.rs` | Converts AsciiMath into MathML |
 | `src/preview.rs` | The local preview server, page template and theme toggle |
 | `src/palette.rs` | The colour palette, stored as plain RGB |
 | `src/lists.rs` | Bullet / numbered / quote continuation on Enter |
@@ -146,10 +150,76 @@ app's palette (`Theme::syntax`), so code sits in the same palette as the rest of
 the page and works in both light and dark. Licence:
 `assets/highlight/LICENSE.txt`.
 
+### Maths
+
+Mathematics is written in [AsciiMath](https://asciimath.org) — plain ASCII, no
+backslashes — and converted to **MathML** *in the app*, alongside the Markdown.
+Every current browser renders MathML natively, so there is no maths JavaScript
+and nothing is fetched at runtime.
+
+**Inline**, in the middle of a sentence:
+
+```md
+Euler's identity is $e^(i pi) + 1 = 0$.
+```
+
+**Display**, opening and closing on their own lines:
+
+```md
+$$
+sum_(i=1)^n i^2 = (n(n+1)(2n+1))/6
+$$
+```
+
+A display block opens with a line that starts with `$$` (indentation is
+allowed) and closes with the next such line. If the opening line also closes on
+the same line, it is a one-line block:
+
+```md
+$$x = (-b +- sqrt(b^2 - 4ac))/(2a)$$
+```
+
+Dollars that are not maths are left as prose — *"costs $5 and $10"* stays text
+— under the usual rules: an opening `$` must not be followed by a space, a
+closing `$` must not be preceded by one, and a closing `$` must not be followed
+by a digit. Write `\$` for a literal dollar. Inside code spans and code blocks,
+`$` is never maths.
+
+What the notation covers:
+
+| Written | Renders as |
+| --- | --- |
+| `x^2`, `x_1`, `x_1^2` | powers and subscripts |
+| `a/b`, `(a+b)/(c-d)` | fractions |
+| `sqrt(x)`, `root(3)(x)` | roots |
+| `sum_(i=1)^n`, `prod_(i=1)^n`, `lim_(x->0)` | limits above and below |
+| `int_0^1`, `oint_C` | integrals, limits to the side |
+| `alpha beta Gamma` | Greek by name |
+| `RR NN ZZ QQ CC` | number sets |
+| `<= >= != ~= -> <-> in !in sub uu nn` | relations and arrows |
+| `vec v hat x bar y dot z ul u` | accents |
+| `abs(x) floor(x) ceil(x) \|x\|` | bars and fences |
+| `text(any text)` | upright text |
+
+For example:
+
+```md
+vec v = (d x)/dt,  hat x,  RR^2,  alpha <= beta,  f: A -> B
+```
+
+Maths is set from the page's own fonts, so it follows the dark/light toggle and
+needs nothing installed; in the editor, maths is tinted with its own colour
+(`Theme::math`).
+
 ### Limitations
 
 It is deliberately not a complete CommonMark implementation. Tables, footnotes,
 reference links and inline HTML are not supported.
+
+The maths is a small implementation of AsciiMath rather than a complete one. It
+covers what is listed above; matrices such as `((a,b),(c,d))` and the font
+commands (`bb`, `cc`, `fr`, …) are not supported and come out as plain text.
+Unknown input is never an error — it just renders as ordinary letters.
 
 ## Tests
 
@@ -158,8 +228,9 @@ cargo test
 ```
 
 The suite covers the Markdown parser, list continuation, the bundled fonts and
-their script coverage, the Markdown→HTML conversion, and the editor itself —
-including headless frames driven through an `egui::Context` (that the
+their script coverage, the Markdown→HTML conversion, the AsciiMath→MathML
+conversion (whose output is checked to be well-formed XML), and the editor
+itself — including headless frames driven through an `egui::Context` (that the
 highlighted layout is byte-for-byte identical to the source, so the caret never
 drifts, and that pressing Enter continues a list while ordinary typing does
 not). The preview server is tested by starting it on a loopback port and making

@@ -18,6 +18,7 @@ mod fonts;
 mod html;
 mod lists;
 mod markdown;
+mod math;
 mod palette;
 mod preview;
 
@@ -1275,7 +1276,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut app = App::new(&ctx, None);
-        app.text = "# Title\n\nwith **bold**".to_owned();
+        app.text = "# Title\n\nwith **bold** and $sqrt(x)$".to_owned();
 
         if !app.ensure_preview() {
             eprintln!("cannot bind a loopback port here; skipping");
@@ -1292,6 +1293,8 @@ mod tests {
         assert!(response.contains("X-Version: 1"), "{response}");
         assert!(response.contains("<h1>Title</h1>"), "{response}");
         assert!(response.contains("<strong>bold</strong>"), "{response}");
+        // AsciiMath reaches the browser as MathML, converted in the app.
+        assert!(response.contains("<msqrt><mi>x</mi></msqrt>"), "{response}");
     }
 
     /// Without a preview there is nothing to publish.

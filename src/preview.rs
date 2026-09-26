@@ -140,7 +140,7 @@ fn handle(stream: TcpStream, doc: &Arc<Mutex<Doc>>, shell: &str) {
                 html.as_bytes(),
             );
         }
-        // Cacheable: the page asks for it once, and it never changes.
+        // Cacheable: the page asks for them once, and they never change.
         "/highlight.js" => respond(
             &stream,
             "200 OK",
@@ -325,6 +325,9 @@ ul, ol { padding-left: 1.4rem; margin: 0 0 1.1em; }
 li { margin: .25em 0; }
 li > ul, li > ol { margin-bottom: 0; }
 del { opacity: .65; }
+/* Maths: converted to MathML in the app and drawn by the browser itself. */
+.math-block { margin: 1.4em 0; overflow-x: auto; overflow-y: hidden; }
+.math-block > math { display: block; width: fit-content; margin: 0 auto; }
 /* highlight.js token classes, mapped onto the palette so both themes work */
 .hljs-comment, .hljs-quote { color: var(--syn-comment); font-style: italic; }
 .hljs-keyword, .hljs-literal, .hljs-selector-tag, .hljs-name, .hljs-built_in, .hljs-meta { color: var(--syn-keyword); }
@@ -514,6 +517,16 @@ mod tests {
         assert!(page.contains(".hljs-keyword"));
         assert!(page.contains(".hljs-string"));
         assert!(page.contains(".hljs-comment"));
+    }
+
+    #[test]
+    fn the_page_styles_display_maths() {
+        // Maths is converted to MathML by the app, so the page only needs the
+        // styling that centres a display block.
+        let page = shell(&Theme::default());
+        assert!(page.contains(".math-block"), "{page}");
+        assert!(!page.contains("MathJax"), "no maths JavaScript is needed");
+        assert!(!page.contains("/mathjax.js"), "nothing extra is fetched");
     }
 
     #[test]

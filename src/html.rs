@@ -9,6 +9,7 @@
 //! [`crate::preview`].
 
 use crate::markdown::{self, ListKind};
+use crate::math;
 
 /// Convert a Markdown document into the body of an HTML page.
 pub fn body(markdown: &str) -> String {
@@ -57,6 +58,34 @@ fn blocks(lines: &[Vec<char>], out: &mut String) {
 
         if is_blank(line) {
             i += 1;
+            continue;
+        }
+
+        // Display maths: handed to the browser as `\[...\]` for MathJax.
+        if let Some(after) = markdown::math_fence(line) {
+            let tex = if let Some(content) = markdown::math_fence_content(line, after) {
+                // A complete `$$...$$` on one line.
+                let tex: String = content.iter().collect();
+                i += 1;
+                tex
+            } else {
+                // Otherwise it runs to the closing `$$`.
+                let mut parts: Vec<String> = vec![line[after..].iter().collect()];
+                i += 1;
+                while i < lines.len() {
+                    if let Some(after) = markdown::math_fence(&lines[i]) {
+                        parts.push(lines[i][after..].iter().collect());
+                        i += 1;
+                        break;
+                    }
+                    parts.push(lines[i].iter().collect());
+                    i += 1;
+                }
+                parts.join("\n")
+            };
+            out.push_str("<div class=\"math-block\">");
+            out.push_str(&math::to_mathml(tex.trim(), true));
+            out.push_str("</div>\n");
             continue;
         }
 
@@ -213,6 +242,16 @@ fn inline(chars: &[char]) -> String {
             }
         }
 
+        // Inline maths, converted to MathML here in the app.
+        if c == '$'
+            && let Some(close) = markdown::find_math_close(chars, i)
+        {
+            let asciimath: String = chars[i + 1..close].iter().collect();
+            out.push_str(&math::to_mathml(asciimath.trim(), false));
+            i = close + 1;
+            continue;
+        }
+
         // Strong emphasis.
         if (c == '*' || c == '_')
             && i + 1 < n
@@ -357,6 +396,68 @@ mod tests {
     fn renders_paragraphs_and_joins_soft_wraps() {
         assert_eq!(html("hello\nworld"), "<p>hello\nworld</p>\n");
         assert_eq!(html("one\n\ntwo"), "<p>one</p>\n<p>two</p>\n");
+    }
+
+    #[test]
+    fn renders_inline_maths_as_mathml() {
+        assert_eq!(
+            html("$x^2$"),
+            "<p><math><msup><mi>x</mi><mn>2</mn></msup></math></p>\n"
+        );
+        assert!(html("and $a/b$ too").contains("<mfrac><mi>a</mi><mi>b</mi></mfrac>"));
+    }
+
+    #[test]
+    fn renders_display_maths_as_display_mathml() {
+        assert_eq!(
+            html("$$\nx^2 + y^2\n$$"),
+            "<div class=\"math-block\"><math display=\"block\">\
+<mrow><msup><mi>x</mi><mn>2</mn></msup><mo>+</mo><msup><mi>y</mi><mn>2</mn></msup></mrow></math></div>\n"
+        );
+        // …and the same thing all on one line.
+        assert_eq!(
+            html("$$x^2$$"),
+            "<div class=\"math-block\"><math display=\"block\">\
+<msup><mi>x</mi><mn>2</mn></msup></math></div>\n"
+        );
+    }
+
+    #[test]
+    fn maths_is_converted_rather_than_read_as_markdown() {
+        // `<` has to survive inside the maths, and is escaped for the document.
+        assert_eq!(
+            html("$a < b$"),
+            "<p><math><mrow><mi>a</mi><mo>&lt;</mo><mi>b</mi></mrow></math></p>\n"
+        );
+    }
+
+    #[test]
+    fn dollars_in_prose_are_left_alone() {
+        assert_eq!(html("costs $5 and $10"), "<p>costs $5 and $10</p>\n");
+        // An escaped dollar is literal, too.
+        assert_eq!(html(r"\$5"), "<p>$5</p>\n");
+    }
+
+    #[test]
+    fn maths_inside_code_is_untouched() {
+        assert_eq!(html("`$x$`"), "<p><code>$x$</code></p>\n");
+        assert!(html("```\n$x$\n```").contains("$x$"));
+    }
+
+    #[test]
+    fn a_document_with_maths() {
+        let out = html(
+            "# Maths\n\nInline $e^(i pi) + 1 = 0$ and display:\n\n$$\nsum_(i=1)^n i\n$$\n",
+        );
+        assert!(out.contains("<h1>Maths</h1>"), "{out}");
+        assert!(out.contains("Inline <math>"), "{out}");
+        assert!(
+            out.contains("<div class=\"math-block\"><math display=\"block\">"),
+            "{out}"
+        );
+        // The sum gets its limits above and below.
+        assert!(out.contains("<munderover"), "{out}");
+        assert!(out.contains('\u{2211}'), "{out}");
     }
 
     #[test]

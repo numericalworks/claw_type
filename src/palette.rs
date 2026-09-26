@@ -47,6 +47,8 @@ pub struct Theme {
     pub heading: [Rgb; 6],
     /// Inline and fenced code.
     pub code: Rgb,
+    /// Mathematics (`$...$` and `$$...$$`) in the editor.
+    pub math: Rgb,
     /// Block quotes.
     pub quote: Rgb,
     /// List markers and numbers.
@@ -83,6 +85,7 @@ impl Default for Theme {
                 (0xc0, 0x82, 0xd8),
             ],
             code: (0x9b, 0xc8, 0x7a),
+            math: (0xcf, 0xa9, 0xf2),
             quote: (0x8a, 0x92, 0xa0),
             list: (0x62, 0xa9, 0xf5),
             link: (0x59, 0xba, 0xc4),
@@ -122,6 +125,7 @@ impl Theme {
                 (0x6c, 0x34, 0x93),
             ],
             code: (0x2c, 0x72, 0x2f),
+            math: (0x6a, 0x37, 0xa8),
             quote: (0x55, 0x5d, 0x69),
             list: (0x0b, 0x6b, 0xd6),
             link: (0x0b, 0x6b, 0xd6),
@@ -151,6 +155,7 @@ impl Theme {
             Role::Heading(level) => self.heading_color(level),
             Role::HeadingMarker(level) => self.heading_color(level),
             Role::Code => self.code,
+            Role::Math => self.math,
             Role::Fence => self.marker,
             Role::Quote => self.quote,
             Role::List => self.list,

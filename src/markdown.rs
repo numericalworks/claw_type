@@ -33,6 +33,8 @@ pub enum Role {
     Link,
     /// Link destinations.
     Url,
+    /// Mathematics (`$...$` and `$$...$$`).
+    Math,
     /// Horizontal rules.
     Rule,
 }
@@ -109,6 +111,9 @@ impl MStyle {
             underline: true,
         }
     }
+    pub const fn math() -> Self {
+        Self::new(Role::Math)
+    }
     pub const fn heading(level: usize) -> Self {
         Self {
             role: Role::Heading(level as u8),
@@ -145,9 +150,21 @@ pub fn highlight(lines: &[String]) -> Vec<Vec<(char, MStyle)>> {
     let mut out = Vec::with_capacity(lines.len());
     // Some `(marker, length)` while inside a fenced code block.
     let mut fence: Option<(char, usize)> = None;
+    // Whether we are between `$$` display-maths delimiters.
+    let mut in_math = false;
 
     for line in lines {
         let chars: Vec<char> = line.chars().collect();
+
+        if in_math {
+            if math_fence(&chars).is_some() {
+                in_math = false;
+                out.push(styled(&chars, MStyle::marker()));
+            } else {
+                out.push(styled(&chars, MStyle::math()));
+            }
+            continue;
+        }
 
         if let Some((marker, len)) = fence {
             if let Some((m, l)) = fence_of(&chars)
@@ -165,6 +182,24 @@ pub fn highlight(lines: &[String]) -> Vec<Vec<(char, MStyle)>> {
         if let Some((m, l)) = fence_of(&chars) {
             fence = Some((m, l));
             out.push(fence_line(&chars));
+            continue;
+        }
+
+        if let Some(after) = math_fence(&chars) {
+            let mut row = styled(&chars[..after], MStyle::marker());
+            match math_fence_content(&chars, after) {
+                // A complete `$$...$$` on one line.
+                Some(content) => {
+                    row.extend(styled(content, MStyle::math()));
+                    row.extend(styled(&chars[after + content.len()..], MStyle::marker()));
+                }
+                // Otherwise it opens a block that runs to the closing `$$`.
+                None => {
+                    in_math = true;
+                    row.extend(styled(&chars[after..], MStyle::math()));
+                }
+            }
+            out.push(row);
             continue;
         }
 
@@ -314,6 +349,59 @@ pub(crate) fn list_prefix(chars: &[char]) -> Option<(usize, usize, ListKind)> {
     None
 }
 
+/// A `$$` display-math fence: the index just past the run of `$`s.
+///
+/// Like a code fence, a line that starts with `$$` either opens display maths
+/// (and is closed by the next such line) or, when the same line also ends with
+/// `$$`, is a single-line block on its own.
+pub(crate) fn math_fence(chars: &[char]) -> Option<usize> {
+    let mut i = 0;
+    while i < chars.len() && chars[i] == ' ' {
+        i += 1;
+    }
+    let mut len = 0;
+    while i + len < chars.len() && chars[i + len] == '$' {
+        len += 1;
+    }
+    (len >= 2).then_some(i + len)
+}
+
+/// The content of a single-line `$$...$$`, given the index just past its opener.
+pub(crate) fn math_fence_content(chars: &[char], after_open: usize) -> Option<&[char]> {
+    let mut k = after_open;
+    while k + 1 < chars.len() {
+        if chars[k] == '$' && chars[k + 1] == '$' {
+            return Some(&chars[after_open..k]);
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Find the closing `$` of inline maths opened at `open`.
+///
+/// These are Pandoc's rules, which is what keeps prose such as *"costs $5 and
+/// $10"* from being mistaken for maths: the opening `$` must be followed
+/// immediately by something that is neither a space nor another `$`, and the
+/// closing `$` must not be preceded by a space nor followed by a digit.
+pub(crate) fn find_math_close(chars: &[char], open: usize) -> Option<usize> {
+    let first = *chars.get(open + 1)?;
+    if first.is_whitespace() || first == '$' {
+        return None;
+    }
+    let mut k = open + 1;
+    while k < chars.len() {
+        if chars[k] == '$'
+            && !chars[k - 1].is_whitespace()
+            && !chars.get(k + 1).is_some_and(|c| c.is_ascii_digit())
+        {
+            return Some(k);
+        }
+        k += 1;
+    }
+    None
+}
+
 pub(crate) fn run_len(chars: &[char], from: usize, c: char) -> usize {
     let mut n = 0;
     while from + n < chars.len() && chars[from + n] == c {
@@ -388,6 +476,17 @@ pub(crate) fn inline(chars: &[char], base: MStyle) -> Vec<(char, MStyle)> {
                 i = close + run;
                 continue;
             }
+        }
+
+        // Inline maths.
+        if c == '$'
+            && let Some(close) = find_math_close(chars, i)
+        {
+            out.push(('$', MStyle::marker()));
+            push_styled(&mut out, &chars[i + 1..close], MStyle::math());
+            out.push(('$', MStyle::marker()));
+            i = close + 1;
+            continue;
         }
 
         // Strong emphasis.
@@ -589,6 +688,52 @@ mod tests {
         let row = &highlighted(&["a * b"])[0];
         // Nothing is marked up, so every character is body text.
         assert!(row.iter().all(|(_, s)| s.role == Role::Text));
+    }
+
+    #[test]
+    fn tags_inline_maths() {
+        assert_eq!(role_in("$x^2$", '$'), Role::Marker);
+        assert_eq!(role_in("$x^2$", 'x'), Role::Math);
+    }
+
+    #[test]
+    fn prose_dollars_are_not_maths() {
+        // Pandoc's rules: nothing space-like right after the opener, nothing
+        // space-like right before the closer, no digit right after the closer.
+        for line in ["costs $5 and $10", "a $ b $ c", "100$", "$ x $"] {
+            let row = &highlighted(&[line])[0];
+            assert!(
+                row.iter().all(|(_, style)| style.role != Role::Math),
+                "{line:?} should not be maths"
+            );
+        }
+    }
+
+    #[test]
+    fn tags_display_maths() {
+        let out = highlighted(&["$$", "x^2", "$$"]);
+        assert_eq!(out[0][0].1.role, Role::Marker);
+        assert!(out[1].iter().all(|(_, style)| style.role == Role::Math));
+        assert_eq!(out[2][0].1.role, Role::Marker);
+    }
+
+    #[test]
+    fn tags_single_line_display_maths() {
+        let out = highlighted(&["$$x^2 + y^2$$"]);
+        assert_eq!(out[0][0].1.role, Role::Marker);
+        assert!(out[0].iter().any(|(_, style)| style.role == Role::Math));
+        assert_eq!(out[0].last().unwrap().1.role, Role::Marker);
+    }
+
+    #[test]
+    fn maths_inside_code_is_not_maths() {
+        // A code span swallows the dollars…
+        let out = highlighted(&["`$x$`"]);
+        assert!(out[0].iter().all(|(_, style)| style.role != Role::Math));
+        assert_eq!(out[0][1].1.role, Role::Code);
+        // …and so does a fenced block.
+        let out = highlighted(&["```", "$y$", "```"]);
+        assert!(out[1].iter().all(|(_, style)| style.role == Role::Code));
     }
 
     #[test]
