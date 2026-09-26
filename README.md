@@ -19,10 +19,13 @@ cargo run --release -- notes.md  # …opening a file
   fades into the background.
 - **Typewriter scrolling** (`Cmd/Ctrl+T`). Keeps the line you are editing
   vertically centred.
-- **Find and replace** (`Cmd/Ctrl+F`). A bar along the bottom of the window
-  finds as you type, tints every match in the text and steps through them; you
-  can replace one match or all of them at once, and there is an optional
-  *Match case* (otherwise ASCII case is ignored). `Esc` closes it.
+- **Find and replace** (`Cmd/Ctrl+F`). A bar along the bottom: type what to
+  look for and press **Search** (or Enter) to find it — nothing is searched
+  until you ask. Every match is tinted in the text and you step through them
+  with Previous/Next; you can replace one match or all of them at once, and
+  there is an optional *Match case* (otherwise ASCII case is ignored). Changing
+  the query clears the results until you press Search again; editing the
+  document keeps them up to date. `Esc` closes it.
 - **Live syntax colouring.** Headings, emphasis, code, quotes, lists and links
   are highlighted in place without hiding a single character of the source.
 - **Browser preview** (`Cmd/Ctrl+P`). Starts a local server, opens your

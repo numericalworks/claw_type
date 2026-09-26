@@ -141,6 +141,9 @@ struct Find {
     matches: Vec<(usize, usize)>,
     /// Which of `matches` the search is on.
     current: usize,
+    /// Whether `matches` come from a search the user asked for. A changed query
+    /// clears them, so nothing is searched until the button is pressed.
+    active: bool,
     /// Recompute `matches` before they are next used.
     stale: bool,
     /// Ask the query field for keyboard focus on the next frame.
@@ -177,9 +180,28 @@ impl Find {
         self.matches.get(self.current).copied()
     }
 
+    /// Run the search for whatever the query holds now.
+    fn search(&mut self) {
+        self.active = true;
+        self.stale = true;
+        self.resume = None;
+        self.scroll = true;
+    }
+
+    /// Forget the results: the query changed, and nothing is searched until the
+    /// user asks again.
+    fn invalidate(&mut self) {
+        self.active = false;
+        self.stale = false;
+        self.matches.clear();
+        self.current = 0;
+        self.scroll = false;
+        self.resume = None;
+    }
+
     /// How the search is going, for the label between the buttons.
     fn summary(&self) -> String {
-        if self.query.is_empty() {
+        if !self.active || self.query.is_empty() {
             String::new()
         } else if self.matches.is_empty() {
             "No matches".to_owned()
@@ -752,8 +774,10 @@ impl App {
         if response.changed() {
             self.dirty = true;
             self.status = None;
-            // The document moved under the search, so its matches are stale.
-            self.find.stale = true;
+            // If a search is up, its results have to follow the edit.
+            if self.find.active {
+                self.find.stale = true;
+            }
         }
 
         // Typewriter scrolling: keep the caret vertically centred, but only
@@ -1436,8 +1460,9 @@ impl App {
     fn open_find(&mut self) {
         self.find.open = true;
         self.find.focus_query = true;
-        self.find.stale = true;
-        self.find.resume = None;
+        // Nothing is searched until the button is pressed, so drop any earlier
+        // results and let the query be edited in peace.
+        self.find.invalidate();
 
         // Start from the selection, as most editors do, when it is a single line.
         if let Some((start, end)) = self.selection {
@@ -1447,7 +1472,6 @@ impl App {
             let picked: String = chars[start..end].iter().collect();
             if !picked.is_empty() && !picked.contains('\n') {
                 self.find.query = picked;
-                self.find.resume = Some(start);
             }
         }
     }
@@ -1468,7 +1492,7 @@ impl App {
             let query = ui.add(
                 egui::TextEdit::singleline(&mut self.find.query)
                     .id(Id::new("claw_type_find"))
-                    .desired_width(220.0)
+                    .desired_width(200.0)
                     .hint_text("Find…"),
             );
             if self.find.focus_query {
@@ -1476,12 +1500,17 @@ impl App {
                 self.find.focus_query = false;
             }
             if query.changed() {
-                self.find.stale = true;
-                self.find.resume = None;
-                self.find.scroll = true;
+                // The query moved on, so the old results no longer apply.
+                self.find.invalidate();
             }
+            // Enter in the field searches, and keeps the caret there to type on.
             if query.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                self.find.next();
+                self.find.search();
+                query.request_focus();
+            }
+            if ui.button("Search").clicked() {
+                self.find.search();
+                query.request_focus();
             }
 
             ui.label(egui::RichText::new(self.find.summary()).size(11.0).color(dim));
@@ -1500,7 +1529,7 @@ impl App {
             let replacement = ui.add(
                 egui::TextEdit::singleline(&mut self.find.replacement)
                     .id(Id::new("claw_type_replace"))
-                    .desired_width(220.0)
+                    .desired_width(200.0)
                     .hint_text("Replace with…"),
             );
 
@@ -1525,8 +1554,7 @@ impl App {
                 .checkbox(&mut self.find.case_sensitive, "Match case")
                 .changed()
             {
-                self.find.stale = true;
-                self.find.resume = None;
+                self.find.invalidate();
             }
 
             if ui.button("Close").clicked() {
@@ -2621,13 +2649,18 @@ mod tests {
         frame(&ctx, &mut app, key(Key::F, Modifiers::COMMAND));
         assert!(app.find.open, "Cmd+F should open the find bar");
 
+        let text = frame_text(&ctx, &mut app, Vec::new());
+        for expected in ["Find", "Search", "Replace", "Match case"] {
+            assert!(text.contains(expected), "missing {expected} in:\n{text}");
+        }
+
         frame(&ctx, &mut app, key(Key::Escape, Modifiers::NONE));
         assert!(!app.find.open, "Esc should close the find bar");
     }
 
-    /// Typing into the query field finds the matches as you go.
+    /// Typing a query does not search; the button (or Enter) does.
     #[test]
-    fn typing_a_query_finds_matches() {
+    fn typing_a_query_does_not_search_until_asked() {
         let ctx = egui::Context::default();
         let mut app = App::new(&ctx, None);
         app.text = "one two one".to_owned();
@@ -2638,7 +2671,22 @@ mod tests {
             frame(&ctx, &mut app, text_event(&ch.to_string()));
         }
         assert_eq!(app.find.query, "one");
+        assert!(
+            app.find.matches.is_empty(),
+            "typing must not search on its own"
+        );
+
+        // Enter in the field searches.
+        frame(&ctx, &mut app, key(Key::Enter, Modifiers::NONE));
         assert_eq!(app.find.matches, vec![(0, 3), (8, 11)]);
+
+        // Changing the query drops the results until asked again.
+        frame(&ctx, &mut app, text_event("x"));
+        assert_eq!(app.find.query, "onex");
+        assert!(
+            app.find.matches.is_empty(),
+            "a changed query should clear the results"
+        );
     }
 
     /// Replacing moves through the matches, and replacing all does them at once.
@@ -2677,6 +2725,7 @@ mod tests {
         let mut find = Find {
             query: "x".to_owned(),
             matches: vec![(0, 1), (5, 6), (9, 10)],
+            active: true,
             ..Find::default()
         };
         assert_eq!(find.summary(), "1 of 3");
