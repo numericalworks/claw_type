@@ -40,6 +40,9 @@ identically.
   window to open it. `Cmd/Ctrl+S` saves straight to the current path.
 - **A hideable status bar** (`Cmd/Ctrl+B`) showing the file, mode, word and
   character counts and the caret position — for a completely bare screen.
+- **Markdown-aware `Enter`.** Pressing Enter inside a bullet, numbered list or
+  block quote carries the marker onto the next line (numbering increments), and
+  an empty item drops its marker to end the list.
 - **Guard rails.** Closing the window with unsaved changes, or quitting with
   `Cmd/Ctrl+Q`, asks before discarding work.
 - **Non-ASCII text is measured properly** — CJK characters are counted by
@@ -47,22 +50,35 @@ identically.
 
 ## Scripts and fonts
 
-egui's bundled fonts cover Latin, Cyrillic, Greek and emoji, but **no Indic,
-Arabic, Hebrew or CJK scripts** — without help those characters fall back to
-`.notdef` and show as empty boxes. To prevent that, `claw_type` looks for a
-**system** font for Tamil (macOS *Tamil MN*; Linux *Noto Sans Tamil* or *Lohit
-Tamil*; Windows *Nirmala UI* or *Latha*) and registers it as a fallback, leaving
-the built-in fonts in charge of everything Latin.
+egui's bundled fonts cover Latin, Cyrillic, Greek and emoji, but no Indic,
+Arabic, Hebrew or CJK scripts — without help those characters fall back to
+`.notdef` and show as empty boxes (tofu). `claw_type` fixes that in two tiers:
 
+**Bundled.** ~5 MB of **Noto Sans** covers every major script *except* CJK —
+Tamil, Devanagari, Bengali, Gurmukhi, Gujarati, Odia, Telugu, Kannada,
+Malayalam, Sinhala, Thai, Lao, Khmer, Myanmar, Tibetan, Arabic, Hebrew,
+Ethiopic, Georgian, Armenian, Thaana, Syriac, N'Ko, Adlam, Cherokee, Canadian
+Aboriginal, Mongolian, and symbols. These are compiled into the binary with
+`include_bytes!` (`assets/fonts/`), so they work on any machine with no
+installation step, offline, and with no runtime cost beyond the file size.
+
+**System, lazily.** CJK fonts run to 50–70 MB, so they are *not* bundled.
+`claw_type` reads one from the system the first time a document actually
+contains CJK text (Han, Hiragana, Katakana, Hangul), and never if it doesn't.
+
+In both cases the Noto fonts are *appended* to each font family, so Latin text
+still renders with the built-in fonts and they only pick up what is missing.
 egui 0.36 shapes text with HarfBuzz (via `harfrust`), so this is enough for
-correct rendering — conjuncts, the split `ை`/`ி` vowel signs and mark
+correct rendering — conjuncts, the split `ை`/`ி` vowel signs, and mark
 positioning such as the `்` pulli all come out right, not just the base letters.
 
-To cover another script, add its font paths in `src/fonts.rs`; the directory
-scan is name-based, so a `*devanagari*` or `*arabic*` search works the same way.
+To add a script, drop its font in `assets/fonts/` and add a line to `BUNDLED` in
+`src/fonts.rs`; to change which CJK font is preferred, edit `CJK_CANDIDATES`.
+The bundled fonts are from <https://github.com/notofonts/noto-fonts>, licensed
+under the SIL Open Font License 1.1 (`assets/fonts/LICENSE-OFL.txt`).
 
 The terminal front-end cannot choose a font — it relies on your terminal
-emulator's, so install a Tamil-capable font there too if you need it.
+emulator's, so install a suitable font there if you need one.
 
 ## Key bindings
 
@@ -81,8 +97,8 @@ emulator's, so install a Tamil-capable font there too if you need it.
 | `Esc` | Close a panel |
 
 The terminal front-end has the same bindings (its status bar also toggles with
-`F2`), plus soft wrapping with cursor movement by screen row, and
-Markdown-aware `Enter` that continues lists and quotes.
+`F2`), plus soft wrapping with cursor movement by screen row. Both front-ends
+share the same list-continuation logic, so `Enter` behaves identically in each.
 
 ## Design
 
@@ -92,7 +108,7 @@ The crate is a small library plus one binary per front-end:
 | --- | --- |
 | `src/markdown.rs` | Parses Markdown into *semantically tagged* characters |
 | `src/palette.rs` | The shared colours, stored as plain RGB |
-| `src/buffer.rs` | The text model: lines, cursor, editing, undo history |
+| `src/buffer.rs` | The text model: lines, cursor, editing, undo history, list continuation |
 | `src/wrap.rs` | Display-width-aware soft wrapping and row mapping |
 | `src/tui/` | The terminal front-end (app state, drawing, `ratatui` styling) |
 | `src/main.rs` | The windowed front-end (layout jobs, shortcuts, dialogs) |

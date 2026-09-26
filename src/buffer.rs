@@ -16,14 +16,17 @@ struct Snapshot {
     col: usize,
 }
 
-/// What pressing Enter at the end of `line` should do next.
+/// What pressing Enter at the end of a line should do next.
+///
+/// Shared by both front-ends so that lists behave identically in the window and
+/// in the terminal.
 #[derive(Debug, PartialEq, Eq)]
-enum Continuation {
+pub enum Continuation {
     /// Just start a fresh empty line.
     None,
     /// Start the next line with this prefix (list / quote continuation).
     Prefix(String),
-    /// The line only held a marker, so drop it and start empty.
+    /// The line held only a marker, so drop it and start empty.
     Clear,
 }
 
@@ -283,23 +286,27 @@ impl Buffer {
         self.begin_group();
         let line = self.lines[self.line].clone();
         let byte = byte_of(&line, self.col);
-        let mut left = line[..byte].to_string();
+        let left = line[..byte].to_string();
         let right = line[byte..].to_string();
 
-        let (prefix, clear_left) = match continuation(&left) {
-            Continuation::Prefix(p) => (p, false),
-            Continuation::Clear => (String::new(), true),
-            Continuation::None => (String::new(), false),
+        let prefix = match list_continuation(&left) {
+            Continuation::Prefix(prefix) => prefix,
+            Continuation::None => String::new(),
+            Continuation::Clear => {
+                // The line held only a marker, so this Enter ends the list:
+                // drop the marker and stay on this line, keeping whatever
+                // followed the cursor.
+                self.lines[self.line] = right;
+                self.col = 0;
+                self.dirty = true;
+                return;
+            }
         };
-        if clear_left {
-            left.clear();
-        }
 
-        let col = prefix.chars().count();
         self.lines[self.line] = left;
         self.lines.insert(self.line + 1, format!("{prefix}{right}"));
         self.line += 1;
-        self.col = col;
+        self.col = prefix.chars().count();
         self.dirty = true;
     }
 
@@ -372,8 +379,12 @@ fn byte_of(s: &str, index: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-/// Decide how to continue a line when Enter is pressed at its end.
-fn continuation(line: &str) -> Continuation {
+/// Decide how to continue a line when Enter is pressed.
+///
+/// `line_before_caret` is the text on the current line *up to the caret*, which
+/// is what decides whether we are inside a bullet, a numbered item or a quote.
+pub fn list_continuation(line_before_caret: &str) -> Continuation {
+    let line = line_before_caret;
     let indent_len = line.len() - line.trim_start().len();
     let indent = &line[..indent_len];
     let rest = &line[indent_len..];
@@ -508,11 +519,13 @@ mod tests {
     }
 
     #[test]
-    fn newline_on_empty_item_clears_the_marker() {
+    fn newline_on_empty_item_ends_the_list() {
         let mut b = buf("  - ");
         b.set_cursor(0, 4);
         b.newline();
-        assert_eq!(b.lines, vec!["", ""]);
+        // The marker is dropped and we stay on the now-empty line.
+        assert_eq!(b.lines, vec![""]);
+        assert_eq!((b.line, b.col), (0, 0));
     }
 
     #[test]

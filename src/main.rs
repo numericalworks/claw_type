@@ -8,11 +8,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use eframe::egui;
-use egui::text::{LayoutJob, TextFormat};
+use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{
     Align, Align2, Color32, FontId, Frame, Id, Key, Margin, Modifiers, Stroke, Vec2,
 };
 
+use claw_type::buffer;
 use claw_type::markdown::{self, MStyle, Mode, Role};
 use claw_type::palette::{Rgb, Theme};
 
@@ -77,6 +78,9 @@ fn parse_args() -> Option<PathBuf> {
     None
 }
 
+/// The `Id` of the main text editor, used to read and write its caret.
+const EDITOR_ID: &str = "claw_type_editor";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Write,
@@ -111,6 +115,8 @@ struct App {
     prev_cursor: Option<usize>,
     /// Whether the editor should grab keyboard focus on the next frame.
     focus_requested: bool,
+    /// Whether we have already tried to load a CJK font from the system.
+    cjk_attempted: bool,
 }
 
 impl App {
@@ -134,6 +140,7 @@ impl App {
             focus_para: (0, 0),
             prev_cursor: None,
             focus_requested: true,
+            cjk_attempted: false,
         };
 
         if let Some(path) = path {
@@ -201,6 +208,23 @@ impl App {
 
     fn set_status(&mut self, message: String) {
         self.status = Some(message);
+    }
+
+    // -- fonts --------------------------------------------------------------
+
+    /// Load a CJK font from the system the first time the document needs one.
+    ///
+    /// CJK fonts run to tens of megabytes, so they are not bundled; they are
+    /// read from disk only when the text actually contains CJK characters.
+    fn maybe_load_cjk(&mut self, ctx: &egui::Context) {
+        if self.cjk_attempted || !fonts::needs_cjk(&self.text) {
+            return;
+        }
+        self.cjk_attempted = true;
+        if fonts::install_cjk(ctx) {
+            // Fonts changed, so re-lay-out the text on the next frame.
+            ctx.request_repaint();
+        }
     }
 
     // -- shortcuts ----------------------------------------------------------
@@ -345,8 +369,13 @@ impl App {
             ui.ctx().fonts_mut(|fonts| fonts.layout_job(job))
         };
 
+        // Snapshot what the editor is looking at before it consumes this
+        // frame's input, so we can tell an Enter apart from other edits.
+        let prev_len = self.text.len();
+        let prev_caret = self.prev_cursor;
+
         let output = egui::TextEdit::multiline(&mut self.text)
-            .id(Id::new("claw_type_editor"))
+            .id(Id::new(EDITOR_ID))
             .frame(Frame::NONE)
             .desired_width(width)
             .desired_rows(1)
@@ -359,10 +388,40 @@ impl App {
             response.request_focus();
             self.focus_requested = false;
         }
-        let cursor = output
+        let mut cursor = output
             .cursor_range
             .as_ref()
             .map(|range| range.primary.index.0);
+
+        // Continue bullet and numbered lists when Enter was pressed. The editor
+        // has already inserted the newline, so this only adds the next marker.
+        //
+        // `TextEdit` reads events without consuming them, so the Enter is still
+        // detectable here — which is what tells a real Enter apart from, say, an
+        // undo that happens to re-insert a newline.
+        let modifiers = ui.ctx().input(|input| input.modifiers);
+        let modified =
+            modifiers.shift || modifiers.alt || modifiers.ctrl || modifiers.command;
+        let enter_pressed = response.has_focus()
+            && ui
+                .ctx()
+                .input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+
+        if enter_pressed
+            && !modified
+            && response.changed()
+            && let Some(prev_caret) = prev_caret
+            && inserted_one_newline(&self.text, prev_len, prev_caret)
+            && let Some(next) = continue_list(&mut self.text, prev_caret)
+        {
+            let mut state = output.state.clone();
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(next))));
+            state.store(ui.ctx(), Id::new(EDITOR_ID));
+            ui.ctx().request_repaint();
+            cursor = Some(next);
+        }
 
         if let Some(index) = cursor {
             let (line, col) = line_col(&self.text, index);
@@ -559,6 +618,7 @@ impl App {
         let theme = self.theme;
         self.shortcuts(ui.ctx());
         self.guard_close(ui.ctx());
+        self.maybe_load_cjk(ui.ctx());
 
         if self.show_bar {
             egui::Panel::bottom("status_bar")
@@ -587,10 +647,10 @@ impl eframe::App for App {
 // -- styling ----------------------------------------------------------------
 
 fn configure(ctx: &egui::Context, theme: &Theme) {
-    // Register a system font for any script the bundled fonts do not cover
-    // (Tamil, and other Indic scripts), so those characters render instead of
-    // showing as empty boxes.
-    fonts::install_tamil_fallback(ctx);
+    // Compile-time font fallbacks for every major non-CJK script, so those
+    // languages render instead of showing as empty boxes. CJK is loaded later,
+    // only if the document needs it (see `App::maybe_load_cjk`).
+    fonts::install_bundled(ctx);
 
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = rgb(theme.bg);
@@ -768,6 +828,59 @@ fn word_count(text: &str) -> usize {
     text.split_whitespace().count()
 }
 
+/// Byte offset of the `index`-th `char`, clamped to the end of the string.
+fn byte_index(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+/// Whether this frame's edit was a single newline inserted at `prev_caret`.
+///
+/// Typing an ordinary character also grows the text by one byte, so the length
+/// alone is not enough: the inserted byte itself has to be the newline.
+fn inserted_one_newline(text: &str, prev_len: usize, prev_caret: usize) -> bool {
+    text.len() == prev_len + 1 && text.as_bytes().get(byte_index(text, prev_caret)) == Some(&b'\n')
+}
+
+/// Continue a bullet, numbered or quoted list after the newline at `caret`.
+///
+/// The editor has already inserted the newline, so this only adds the next
+/// marker and returns the caret position it should sit at. Returns `None` when
+/// the line is not a list item, in which case nothing is changed.
+fn continue_list(text: &mut String, caret: usize) -> Option<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let caret = caret.min(chars.len());
+    let line_start = chars[..caret]
+        .iter()
+        .rposition(|c| *c == '\n')
+        .map(|position| position + 1)
+        .unwrap_or(0);
+    let before_caret: String = chars[line_start..caret].iter().collect();
+
+    match buffer::list_continuation(&before_caret) {
+        buffer::Continuation::None => None,
+        buffer::Continuation::Prefix(prefix) => {
+            // The newline Enter added sits at `caret`; the marker follows it.
+            let insert_at = caret + 1;
+            let byte = byte_index(text, insert_at);
+            text.insert_str(byte, &prefix);
+            Some(insert_at + prefix.chars().count())
+        }
+        buffer::Continuation::Clear => {
+            // The line held only a marker, so this Enter ends the list: drop the
+            // marker *and* the newline the editor just added, leaving one empty
+            // line. `caret` is the newline, so removing up to `caret + 1` keeps
+            // whatever followed the caret on this line.
+            let start = byte_index(text, line_start);
+            let end = byte_index(text, caret + 1);
+            text.replace_range(start..end, "");
+            Some(line_start)
+        }
+    }
+}
+
 /// Convert a character index into a `(line, column)` pair.
 fn line_col(text: &str, char_index: usize) -> (usize, usize) {
     let mut line = 0;
@@ -834,6 +947,7 @@ fn save_dialog() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::widgets::text_edit::TextEditState;
 
     #[test]
     fn line_col_counts_characters() {
@@ -964,35 +1078,218 @@ mod tests {
         sorted.len()
     }
 
-    /// Tamil must render with real glyphs, not `.notdef` boxes.
-    ///
-    /// Without a Tamil font every character falls back to the same `.notdef`
-    /// glyph and so shares one advance width; with the fallback registered the
-    /// glyphs (and their widths) differ.
+    /// Registering the bundled fonts must change the glyphs, not merely the
+    /// font: without them every character falls back to one `.notdef` box and
+    /// therefore shares a single advance width.
     #[test]
-    fn tamil_renders_with_real_glyphs() {
+    fn bundled_fallbacks_change_the_glyphs() {
         let text = "வாழ்க வையகம்";
-
-        if fonts::find_tamil_font().is_none() {
-            eprintln!("no Tamil font installed; cannot check rendering");
-            return;
-        }
 
         let without = glyph_widths(&egui::Context::default(), text);
 
         let ctx = egui::Context::default();
-        fonts::install_tamil_fallback(&ctx);
+        fonts::install_bundled(&ctx);
         let with = glyph_widths(&ctx, text);
 
         assert!(!without.is_empty() && !with.is_empty());
         assert!(
             distinct(&with) > distinct(&without),
-            "fallback should bring in real glyphs: without={without:?} with={with:?}"
+            "bundled fonts should bring in real glyphs: without={without:?} with={with:?}"
         );
+    }
+
+    /// Every bundled script renders with real, varying glyphs — i.e. no tofu.
+    #[test]
+    fn bundled_fonts_render_many_scripts() {
+        let ctx = egui::Context::default();
+        fonts::install_bundled(&ctx);
+
+        let samples = [
+            ("Tamil", "வாழ்க வையகம்"),
+            ("Devanagari", "नमस्ते दुनिया"),
+            ("Bengali", "হ্যালো বিশ্ব"),
+            ("Gujarati", "નમસ્તે દુનિયા"),
+            ("Telugu", "హలో ప్రపంచం"),
+            ("Kannada", "ಹಲೋ ವಿಶ್ವ"),
+            ("Malayalam", "ഹലോ വേൾഡ്"),
+            ("Sinhala", "හෙලෝ වර්ල්ඩ්"),
+            ("Thai", "สวัสดีชาวโลก"),
+            ("Khmer", "សួស្តី"),
+            ("Arabic", "مرحبا بالعالم"),
+            ("Hebrew", "שלום עולם"),
+            ("Georgian", "გამარჯობა"),
+            ("Armenian", "Բարեւ աշխարհ"),
+            ("Ethiopic", "ሰላም ልዑል"),
+        ];
+
+        for (name, text) in samples {
+            let widths = glyph_widths(&ctx, text);
+            assert!(
+                distinct(&widths) >= 2,
+                "{name} fell back to a single glyph width (tofu?): {widths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn continues_numbered_lists() {
+        // The editor has already inserted the newline after "1. Something".
+        let mut text = "1. Something\n".to_owned();
+        assert_eq!(continue_list(&mut text, 12), Some(16));
+        assert_eq!(text, "1. Something\n2. ");
+    }
+
+    #[test]
+    fn increments_the_list_number() {
+        let mut text = "9. nine\n".to_owned();
+        assert_eq!(continue_list(&mut text, 7), Some(12));
+        assert_eq!(text, "9. nine\n10. ");
+    }
+
+    #[test]
+    fn continues_bullet_lists() {
+        let mut text = "- one\n".to_owned();
+        assert_eq!(continue_list(&mut text, 5), Some(8));
+        assert_eq!(text, "- one\n- ");
+    }
+
+    #[test]
+    fn continues_quotes() {
+        let mut text = "> hi\n".to_owned();
+        assert_eq!(continue_list(&mut text, 4), Some(7));
+        assert_eq!(text, "> hi\n> ");
+    }
+
+    #[test]
+    fn enter_on_an_empty_item_ends_the_list() {
+        // The editor has already added the newline after "- ".
+        let mut text = "- \n".to_owned();
+        assert_eq!(continue_list(&mut text, 2), Some(0));
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn plain_lines_are_left_alone() {
+        let mut text = "just prose\n".to_owned();
+        assert_eq!(continue_list(&mut text, 10), None);
+        assert_eq!(text, "just prose\n");
+    }
+
+    /// A synthetic text-input event, as a keystroke produces.
+    fn text_event(text: &str) -> Vec<egui::Event> {
+        vec![egui::Event::Text(text.to_owned())]
+    }
+
+    /// Put the caret at `caret` and focus the editor, as a click would.
+    fn focus_editor_at(ctx: &egui::Context, caret: usize) {
+        let id = Id::new(EDITOR_ID);
+        let mut state = TextEditState::default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::one(CCursor::new(caret))));
+        state.store(ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+    }
+
+    #[test]
+    fn only_a_newline_counts_as_enter() {
+        // `prev_len` is the byte length *before* this frame's edit.
+        // Typing one ASCII character grows the text by one byte too…
+        assert!(!inserted_one_newline("2. T", 3, 3));
+        // …a multi-byte character grows it by more than one…
+        assert!(!inserted_one_newline("2. \u{e9}", 3, 3));
+        // …and two characters at once grows it by two.
+        assert!(!inserted_one_newline("2. ab", 3, 3));
+        // Only a real newline at the caret qualifies.
+        assert!(inserted_one_newline("2. \n", 3, 3));
+        assert!(!inserted_one_newline("2. \n", 3, 2));
+    }
+
+    /// Regression: typing inside a list must not spray markers everywhere.
+    #[test]
+    fn typing_after_a_marker_adds_no_more_markers() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "1. Some stuff".to_owned();
+        focus_editor_at(&ctx, 13);
+
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, key(Key::Enter, Modifiers::NONE));
+        assert_eq!(app.text, "1. Some stuff\n2. ");
+
+        // Type a phrase one character per frame, the way a keypress arrives.
+        for ch in "This is cool".chars() {
+            frame(&ctx, &mut app, text_event(&ch.to_string()));
+        }
+        assert_eq!(app.text, "1. Some stuff\n2. This is cool");
+    }
+
+    /// End to end: pressing Enter in the editor continues a list.
+    #[test]
+    fn enter_continues_a_list_in_the_editor() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "1. Something".to_owned();
+
+        // Put the caret at the end of the line, and focus the editor.
+        focus_editor_at(&ctx, 12);
+
+        // A frame with no input, so the app learns where the caret is.
+        frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.text, "1. Something");
+
+        // Then Enter.
+        frame(&ctx, &mut app, key(Key::Enter, Modifiers::NONE));
+        assert_eq!(app.text, "1. Something\n2. ");
+    }
+
+    /// Enter on the fresh, empty item ends the list without a stray blank line.
+    #[test]
+    fn enter_again_ends_the_list_in_the_editor() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "1. one".to_owned();
+        focus_editor_at(&ctx, 6);
+
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, key(Key::Enter, Modifiers::NONE));
+        assert_eq!(app.text, "1. one\n2. ");
+
+        frame(&ctx, &mut app, key(Key::Enter, Modifiers::NONE));
+        assert_eq!(app.text, "1. one\n");
+    }
+
+    /// Plain prose gets an ordinary newline, not a marker.
+    #[test]
+    fn enter_in_prose_adds_no_marker() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(&ctx, None);
+        app.text = "just prose".to_owned();
+
+        focus_editor_at(&ctx, 10);
+
+        frame(&ctx, &mut app, Vec::new());
+        frame(&ctx, &mut app, key(Key::Enter, Modifiers::NONE));
+        assert_eq!(app.text, "just prose\n");
+    }
+
+    /// The lazy CJK load fires for CJK documents and stays dormant otherwise.
+    #[test]
+    fn cjk_text_triggers_the_cjk_font_path() {
+        let ctx = egui::Context::default();
+
+        let mut latin = App::new(&ctx, None);
+        latin.text = "வாழ்க வையகம் नमस्ते مرحبا".to_owned();
+        frame(&ctx, &mut latin, Vec::new());
         assert!(
-            distinct(&with) >= 3,
-            "Tamil glyphs should not share a single advance: {with:?}"
+            !latin.cjk_attempted,
+            "non-CJK text should not load a CJK font"
         );
+
+        let mut cjk = App::new(&ctx, None);
+        cjk.text = "日本語 and 한국어".to_owned();
+        frame(&ctx, &mut cjk, Vec::new());
+        assert!(cjk.cjk_attempted, "CJK text should attempt a CJK font");
     }
 
     /// The window lays out Tamil text without panicking.
