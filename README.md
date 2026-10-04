@@ -225,10 +225,25 @@ Maths is set from the page's own fonts, so it follows the dark/light toggle and
 needs nothing installed; in the editor, maths is tinted with its own colour
 (`Theme::math`).
 
+### Raw HTML
+
+HTML in the document is passed through to the page as it stands, so embeds render
+rather than showing up as their own text:
+
+```html
+<iframe width="1280" height="720" src="https://example.com/video?embedplayer=true"></iframe>
+```
+
+A line that opens a block-level tag (`<iframe>`, `<video>`, `<div>`, …) is a raw
+HTML block, running to the next blank line; the tags allowed to do that are the
+usual CommonMark set. HTML inside a line — `<br>`, `<span>`, an `<a>` — is passed
+through too. Because it goes into the page verbatim, preview only documents you
+trust; ordinary text, code and `&` are still escaped as before.
+
 ### Limitations
 
-It is deliberately not a complete CommonMark implementation. Tables, footnotes,
-reference links and inline HTML are not supported.
+It is deliberately not a complete CommonMark implementation. Tables, footnotes
+and reference links are not supported.
 
 The maths is a small implementation of AsciiMath rather than a complete one. It
 covers what is listed above; matrices such as `((a,b),(c,d))` and the font

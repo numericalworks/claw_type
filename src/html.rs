@@ -131,6 +131,17 @@ fn blocks(lines: &[Vec<char>], out: &mut String) {
             continue;
         }
 
+        // Raw HTML block: hand it to the browser as it stands, so embeds such as
+        // `<iframe>` render instead of showing up as their own text.
+        if html_block_start(line) {
+            while i < lines.len() && !is_blank(&lines[i]) {
+                out.extend(lines[i].iter());
+                out.push('\n');
+                i += 1;
+            }
+            continue;
+        }
+
         // Paragraph: runs until a blank line or the start of another block.
         let mut paragraph = Vec::new();
         while i < lines.len() {
@@ -319,11 +330,165 @@ fn inline(chars: &[char]) -> String {
             }
         }
 
+        // Inline HTML, passed straight through so the browser renders it.
+        if c == '<'
+            && let Some(end) = html_tag_end(chars, i)
+        {
+            out.extend(chars[i..end].iter());
+            i = end;
+            continue;
+        }
+
         push_escaped(&mut out, c);
         i += 1;
     }
 
     out
+}
+
+/// Whether `line` opens a raw HTML block: a comment or declaration, or a
+/// block-level tag (up to three spaces in). A plain inline tag on a line of its
+/// own is left to the paragraph, which renders it inline.
+fn html_block_start(line: &[char]) -> bool {
+    let mut i = 0;
+    while i < line.len() && i < 3 && line[i] == ' ' {
+        i += 1;
+    }
+    if line.get(i) != Some(&'<') {
+        return false;
+    }
+    // Comments (`<!--`), declarations (`<!`) and processing instructions (`<?`).
+    if matches!(line.get(i + 1), Some('!') | Some('?')) {
+        return true;
+    }
+    let closing = line.get(i + 1) == Some(&'/');
+    let start = i + if closing { 2 } else { 1 };
+    if !matches!(line.get(start), Some(c) if c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let mut end = start;
+    while matches!(line.get(end), Some(c) if c.is_ascii_alphanumeric() || *c == '-') {
+        end += 1;
+    }
+    let name: String = line[start..end].iter().collect();
+    is_block_tag(&name)
+}
+
+/// The block-level HTML tags, per CommonMark; embeds like `iframe` and `video`
+/// are among them, so a line that opens one is passed through as a block.
+fn is_block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "base"
+            | "basefont"
+            | "blockquote"
+            | "body"
+            | "caption"
+            | "center"
+            | "col"
+            | "colgroup"
+            | "dd"
+            | "details"
+            | "dialog"
+            | "dir"
+            | "div"
+            | "dl"
+            | "dt"
+            | "fieldset"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "frame"
+            | "frameset"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "head"
+            | "header"
+            | "hr"
+            | "html"
+            | "iframe"
+            | "legend"
+            | "li"
+            | "link"
+            | "main"
+            | "menu"
+            | "menuitem"
+            | "nav"
+            | "noframes"
+            | "ol"
+            | "optgroup"
+            | "option"
+            | "p"
+            | "param"
+            | "pre"
+            | "script"
+            | "search"
+            | "section"
+            | "style"
+            | "summary"
+            | "table"
+            | "tbody"
+            | "td"
+            | "textarea"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "title"
+            | "tr"
+            | "track"
+            | "ul"
+            | "video"
+    )
+}
+
+/// If a raw HTML tag starts at `i`, the index just past its closing `>`.
+///
+/// An attribute value may hold a `>`, so quotes are respected.
+fn html_tag_end(chars: &[char], i: usize) -> Option<usize> {
+    if chars.get(i) != Some(&'<') {
+        return None;
+    }
+    match chars.get(i + 1) {
+        Some(c) if c.is_ascii_alphabetic() => {
+            let mut j = i + 2;
+            while matches!(chars.get(j), Some(c) if c.is_ascii_alphanumeric() || *c == '-') {
+                j += 1;
+            }
+            match chars.get(j) {
+                Some(c) if c.is_whitespace() || *c == '/' || *c == '>' => {}
+                _ => return None,
+            }
+        }
+        Some('/') => match chars.get(i + 2) {
+            Some(c) if c.is_ascii_alphabetic() => {}
+            _ => return None,
+        },
+        Some('!') | Some('?') => {}
+        _ => return None,
+    }
+
+    let mut quote: Option<char> = None;
+    let mut j = i + 1;
+    while j < chars.len() {
+        let c = chars[j];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '>' => return Some(j + 1),
+            None => {}
+        }
+        j += 1;
+    }
+    None
 }
 
 fn is_blank(line: &[char]) -> bool {
@@ -336,6 +501,7 @@ fn starts_block(line: &[char]) -> bool {
         || markdown::is_rule(line)
         || markdown::blockquote_prefix(line).is_some()
         || markdown::list_prefix(line).is_some()
+        || html_block_start(line)
 }
 
 /// The info string after a fence, e.g. `rust` in ```` ```rust ````.
@@ -528,11 +694,44 @@ mod tests {
     }
 
     #[test]
-    fn escapes_html_metacharacters() {
-        assert_eq!(html("<script>alert(1)</script>"), "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>\n");
+    fn passes_raw_html_through_but_escapes_text() {
+        // A block tag, such as an embed, is handed to the browser as it stands.
+        assert_eq!(
+            html("<iframe src=\"https://example.com\"></iframe>"),
+            "<iframe src=\"https://example.com\"></iframe>\n"
+        );
+        // …and so is inline HTML in the middle of a line.
+        assert_eq!(html("a <br> b"), "<p>a <br> b</p>\n");
+        assert_eq!(html("<span>x</span>"), "<p><span>x</span></p>\n");
+        // A `>` inside a quoted attribute does not end the tag early.
+        assert_eq!(html("<a title=\"a>b\">x</a>"), "<p><a title=\"a>b\">x</a></p>\n");
+        // What is not a tag is still escaped: prose…
         assert_eq!(html("a & b"), "<p>a &amp; b</p>\n");
+        // …and a near-miss like a broken tag is left as text, not passed on.
+        assert_eq!(html("a < 3 and 5 > 4"), "<p>a &lt; 3 and 5 &gt; 4</p>\n");
+        // Code is always literal, whatever it holds.
         assert!(html("```\n<b>&</b>\n```").contains("&lt;b&gt;&amp;&lt;/b&gt;"));
         assert!(html("[x](https://e.com/?a=1&b=2)").contains("href=\"https://e.com/?a=1&amp;b=2\""));
+    }
+
+    #[test]
+    fn renders_an_embedded_iframe_verbatim() {
+        let line = "<iframe width=\"4000\" height=\"2250\" frameborder=\"0\" loading=\"lazy\" allow=\"autoplay; fullscreen; picture-in-picture; clipboard-write; web-share\" allowfullscreen src=\"https://commons.wikimedia.org/wiki/File:Big_Buck_Bunny_4K.webm?embedplayer=true\" />";
+        assert_eq!(html(line), format!("{line}\n"));
+    }
+
+    #[test]
+    fn renders_a_multi_line_html_block() {
+        assert_eq!(
+            html("<div class=\"note\">\nhello\n</div>"),
+            "<div class=\"note\">\nhello\n</div>\n"
+        );
+    }
+
+    #[test]
+    fn an_autolink_like_line_is_not_html() {
+        // `<http://…>` is not a tag, so it stays escaped text.
+        assert_eq!(html("<http://example.com>"), "<p>&lt;http://example.com&gt;</p>\n");
     }
 
     #[test]
